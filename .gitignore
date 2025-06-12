@@ -1,5 +1,6 @@
-.venv
 .ipynb_checkpoints
 .idea
 /data/*
 !/data/.gitkeep
+/features/*
+!/features/.gitkeep
