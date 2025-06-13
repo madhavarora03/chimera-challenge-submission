@@ -1,6 +1,6 @@
 # CHIMERA Challenge Submission
 
-> Team MSD<br>
+> Team TBG Lab<br>
 > Task 3
 
 ## Data Download
