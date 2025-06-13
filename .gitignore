@@ -4,3 +4,4 @@
 !/data/.gitkeep
 /features/*
 !/features/.gitkeep
+.venv
