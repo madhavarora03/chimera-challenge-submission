@@ -24,3 +24,40 @@ This command will download the dataset to the current directory.
 Make sure you are in the desired directory where you want the data to be stored.
 
 **Note:** The `--no-sign-request` flag ensures you can access the dataset without AWS credentials.
+
+## Download dependencies
+To set up the environment, make sure you have the following dependencies:
+- **Python:** Version 3.12
+- **CUDA:** Version 12.6 (ensure that your GPU supports this version)
+
+Once the prerequisites are met, follow these steps to set up your environment:
+
+1. Create a virtual environment:
+    ```bash
+    python -m venv .venv
+    ```
+2. Activate the virtual environment:
+   - On macOS/Linux:
+       ```bash
+       source .venv/bin/activate
+       ```
+   - On Windows:
+      ```bash
+      .venv\Scripts\activate
+      ```
+
+3. Install the required dependencies:
+    ```bash
+    python -m ven .venv
+    source .venv/bin/activate
+    pip install -r requirements.txt
+    ```
+
+## Visualize the Dataset
+
+To visualize the dataset, you can use the provided Jupyter notebook.
+Open a terminal or command prompt, and run the following command to start the Jupyter notebook:
+
+```bash
+jupyter notebook notebooks/data_visualization.ipynb
+```
