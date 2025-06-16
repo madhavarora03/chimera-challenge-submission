@@ -70,21 +70,23 @@ class ChimeraDataset(Dataset):
         hist_feats_path = os.path.join(self.features_dir, f"{pid}_HE.pt")
         hist_feats = torch.load(hist_feats_path)  # [N_patches, feature_dim]
 
-        # Load coordinates
-        hist_coords_path = os.path.join(self.coords_dir, f"{pid}_HE.npy")
-        hist_coords_raw = np.load(hist_coords_path)
+        hist_embedding = hist_feats.mean(dim=0)
 
-        # If structured array, extract only x and y coordinates
-        if hist_coords_raw.dtype.fields is not None:
-            selected_fields = ["x", "y"]
-            hist_coords = np.stack([
-                hist_coords_raw[field].astype(np.float32)
-                for field in selected_fields
-            ], axis=1)
-        else:
-            hist_coords = hist_coords_raw.astype(np.float32)
+        # # Load coordinates
+        # hist_coords_path = os.path.join(self.coords_dir, f"{pid}_HE.npy")
+        # hist_coords_raw = np.load(hist_coords_path)
 
-        hist_coords = torch.from_numpy(hist_coords)  # [num_patches, 3]
+        # # If structured array, extract only x and y coordinates
+        # if hist_coords_raw.dtype.fields is not None:
+        #     selected_fields = ["x", "y"]
+        #     hist_coords = np.stack([
+        #         hist_coords_raw[field].astype(np.float32)
+        #         for field in selected_fields
+        #     ], axis=1)
+        # else:
+        #     hist_coords = hist_coords_raw.astype(np.float32)
+        #
+        # hist_coords = torch.from_numpy(hist_coords)  # [num_patches, 3]
 
         # Load RNA expression vector
         rna_path = os.path.join(self.data_dir, pid, f"{pid}_RNA.json")
@@ -103,8 +105,8 @@ class ChimeraDataset(Dataset):
 
         return {
             "pid": pid,
-            "hist_feats": hist_feats,
-            "hist_coords": hist_coords,
+            "hist_embedding": hist_embedding,
+            # "hist_coords": hist_coords,
             "rna_vec": rna_vec,
             "clinical_vec": clinical_vec,
             "time": y_time,
@@ -113,14 +115,17 @@ class ChimeraDataset(Dataset):
 
 
 def test():
-    patient_ids = ["3A_001"]
+    patient_ids = sorted(os.listdir("data"))
+    patient_ids = [pid for pid in patient_ids if pid != ".gitkeep" and pid != "task3_quality_control.csv"]
+
     dataset = ChimeraDataset(
         patient_ids=patient_ids,
         features_dir="features/features",
         coords_dir="features/coordinates",
         data_dir="data"
     )
-    dataloader = DataLoader(dataset, batch_size=1, shuffle=False)
+
+    dataloader = DataLoader(dataset, batch_size=8, shuffle=False)
 
     # Get first batch
     batch = next(iter(dataloader))
@@ -129,12 +134,12 @@ def test():
     print("=" * 40)
 
     print(f"Patient ID: {batch['pid'][0]}")
-    print(f"Histopathology features: {batch['hist_feats'].shape} | dtype: {batch['hist_feats'].dtype}")
-    print(f"Histopathology coordinates: {batch['hist_coords'].shape} | dtype: {batch['hist_coords'].dtype}")
+    print(f"Histopathology features: {batch['hist_embedding'].shape} | dtype: {batch['hist_embedding'].dtype}")
+    # print(f"Histopathology coordinates: {batch['hist_coords'].shape} | dtype: {batch['hist_coords'].dtype}")
     print(f"RNA vector: {batch['rna_vec'].shape} | dtype: {batch['rna_vec'].dtype}")
     print(f"Clinical vector: {batch['clinical_vec'].shape} | dtype: {batch['clinical_vec'].dtype}")
-    print(f"Time to event: {batch['time'].item()}")
-    print(f"Progression event: {batch['event'].item()}")
+    print(f"Time to event: {batch['time'][0].item()}")
+    print(f"Progression event: {batch['event'][0].item()}")
 
     print("=" * 40)
 

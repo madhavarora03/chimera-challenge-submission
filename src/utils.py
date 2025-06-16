@@ -28,6 +28,17 @@ def encode_clinical(cd: Dict[str, Union[str, int, float]]) -> Tensor:
         "BRS": {"BRS1": 0, "BRS2": 1, "BRS3": 2}
     }
 
-    numeric = [float(cd["age"]), int(cd.get("no_instillations", -1))]
-    categorical = [cat_map[key][cd[key]] for key in cat_map]
-    return torch.tensor(numeric + categorical, dtype=torch.float)
+    # Safe numeric encoding
+    age = float(cd.get("age", 0.0))
+    instills = int(cd.get("no_instillations", -1))
+
+    categorical = []
+    for key, mapping in cat_map.items():
+        value = cd.get(key, None)
+        if value not in mapping:
+            print(f"⚠️ Warning: Unexpected value `{value}` for key `{key}` — defaulting to 0.")
+            categorical.append(0)
+        else:
+            categorical.append(mapping[value])
+
+    return torch.tensor([age, instills] + categorical, dtype=torch.float)
