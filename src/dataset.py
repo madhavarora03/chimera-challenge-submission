@@ -8,24 +8,25 @@ import torch
 from torch import Tensor
 from torch.utils.data import Dataset, DataLoader
 
-from utils import encode_clinical
+from utils import encode_clinical, chimera_collate_fn
 
 
 class ChimeraDataset(Dataset):
     """
-    PyTorch Dataset for loading multimodal patient data for the Chimera Challenge Task 3, with pre-extracted features.
+    Chimera Challenge Dataset with random sampling of patch features per patient.
 
     Each sample includes:
-    - Histopathology patch features and spatial coordinates
+    - Randomly sampled (or padded) histopathology patch features with coordinates
     - RNA expression vector
     - Clinical metadata
-    - Survival outcome labels (time to recurrence and progression status)
+    - Survival labels
 
     Args:
-        patient_ids (List[str]): List of patient identifiers.
-        features_dir (str | PathLike): Directory path containing patch-level histopathology features (*.pt).
-        coords_dir (str | PathLike): Directory path containing patch spatial coordinates (*.npy).
-        data_dir (str | PathLike): Root directory containing subfolders for each patient with *_RNA.json and *_CD.json.
+        patient_ids (List[str])
+        features_dir (str | PathLike)
+        coords_dir (str | PathLike)
+        data_dir (str | PathLike)
+        max_patches (int): Number of patches to sample per patient (default=512)
     """
 
     def __init__(
@@ -33,80 +34,53 @@ class ChimeraDataset(Dataset):
             patient_ids: List[str],
             features_dir: str | PathLike,
             coords_dir: str | PathLike,
-            data_dir: str | PathLike
+            data_dir: str | PathLike,
+            max_patches: int = 512
     ) -> None:
         self.patient_ids = patient_ids
         self.features_dir = features_dir
         self.coords_dir = coords_dir
         self.data_dir = data_dir
+        self.max_patches = max_patches
 
     def __len__(self) -> int:
-        """
-        Returns:
-            int: Number of patients in the dataset.
-        """
         return len(self.patient_ids)
 
     def __getitem__(self, idx: int) -> Dict[str, Union[str, Tensor, float, int]]:
-        """
-        Loads a single patient sample with all associated modalities.
+        pid = self.patient_ids[idx]
 
-        Args:
-            idx (int): Index of the patient in the list.
+        # Load features and coordinates
+        feats = torch.load(os.path.join(self.features_dir, f"{pid}_HE.pt"))  # [N, D]
+        coords_np = np.load(os.path.join(self.coords_dir, f"{pid}_HE.npy"))
+        coords = (np.stack([coords_np['x'], coords_np['y']], axis=1) if coords_np.dtype.fields
+                  else coords_np[:, :2]).astype(np.float32)
+        coords = torch.from_numpy(coords)  # [N, 2]
 
-        Returns:
-            Dict[str, Union[str, Tensor, float, int]]: A dictionary containing:
-                - "pid": Patient ID
-                - "hist_feats": Tensor of shape [N, D] (patch features)
-                - "hist_coords": Tensor of shape [N, 2] (x, y coordinates)
-                - "rna_vec": RNA expression vector
-                - "clinical_vec": Encoded clinical features
-                - "time": Time to recurrence or follow-up
-                - "event": Progression event flag (1 or 0)
-        """
-        pid = str(self.patient_ids[idx])
+        hist_patches = torch.cat([feats, coords], dim=1)  # [N, D+2]
+        num_patches = hist_patches.shape[0]
 
-        # Load histopathology features
-        hist_feats_path = os.path.join(self.features_dir, f"{pid}_HE.pt")
-        hist_feats = torch.load(hist_feats_path)  # [N_patches, feature_dim]
+        if num_patches >= self.max_patches:
+            indices = torch.randperm(num_patches)[:self.max_patches]
+            hist_sampled = hist_patches[indices]
+        else:
+            pad_size = self.max_patches - num_patches
+            pad_tensor = torch.zeros(pad_size, hist_patches.size(1))
+            hist_sampled = torch.cat([hist_patches, pad_tensor], dim=0)
 
-        hist_embedding = hist_feats.mean(dim=0)
-
-        # # Load coordinates
-        # hist_coords_path = os.path.join(self.coords_dir, f"{pid}_HE.npy")
-        # hist_coords_raw = np.load(hist_coords_path)
-
-        # # If structured array, extract only x and y coordinates
-        # if hist_coords_raw.dtype.fields is not None:
-        #     selected_fields = ["x", "y"]
-        #     hist_coords = np.stack([
-        #         hist_coords_raw[field].astype(np.float32)
-        #         for field in selected_fields
-        #     ], axis=1)
-        # else:
-        #     hist_coords = hist_coords_raw.astype(np.float32)
-        #
-        # hist_coords = torch.from_numpy(hist_coords)  # [num_patches, 3]
-
-        # Load RNA expression vector
-        rna_path = os.path.join(self.data_dir, pid, f"{pid}_RNA.json")
-        with open(rna_path, 'r') as f:
+        # RNA vector
+        with open(os.path.join(self.data_dir, pid, f"{pid}_RNA.json"), 'r') as f:
             rna_vec = torch.tensor(list(json.load(f).values()), dtype=torch.float)
 
-        # Load clinical data
-        cd_path = os.path.join(self.data_dir, pid, f"{pid}_CD.json")
-        with open(cd_path, 'r') as f:
+        # Clinical
+        with open(os.path.join(self.data_dir, pid, f"{pid}_CD.json"), 'r') as f:
             cd = json.load(f)
         clinical_vec = encode_clinical(cd)
-
-        # Labels
         y_time = float(cd["time_to_HG_recur_or_FUend"])
         y_event = int(cd["progression"])
 
         return {
             "pid": pid,
-            "hist_embedding": hist_embedding,
-            # "hist_coords": hist_coords,
+            "hist_patches": hist_sampled,
             "rna_vec": rna_vec,
             "clinical_vec": clinical_vec,
             "time": y_time,
@@ -115,32 +89,30 @@ class ChimeraDataset(Dataset):
 
 
 def test():
-    patient_ids = sorted(os.listdir("data"))
-    patient_ids = [pid for pid in patient_ids if pid != ".gitkeep" and pid != "task3_quality_control.csv"]
+    patient_ids = sorted([
+        pid for pid in os.listdir("data")
+        if pid not in [".gitkeep", "task3_quality_control.csv"]
+    ])
 
     dataset = ChimeraDataset(
         patient_ids=patient_ids,
         features_dir="features/features",
         coords_dir="features/coordinates",
-        data_dir="data"
+        data_dir="data",
+        max_patches=1048576
     )
 
-    dataloader = DataLoader(dataset, batch_size=8, shuffle=False)
-
-    # Get first batch
+    dataloader = DataLoader(dataset, batch_size=4, collate_fn=chimera_collate_fn, shuffle=False)
     batch = next(iter(dataloader))
 
     print("✅ ChimeraDataset Test Output:")
     print("=" * 40)
-
     print(f"Patient ID: {batch['pid'][0]}")
-    print(f"Histopathology features: {batch['hist_embedding'].shape} | dtype: {batch['hist_embedding'].dtype}")
-    # print(f"Histopathology coordinates: {batch['hist_coords'].shape} | dtype: {batch['hist_coords'].dtype}")
+    print(f"Histopathology patches: {batch['hist_patches'].shape} | dtype: {batch['hist_patches'].dtype}")
     print(f"RNA vector: {batch['rna_vec'].shape} | dtype: {batch['rna_vec'].dtype}")
     print(f"Clinical vector: {batch['clinical_vec'].shape} | dtype: {batch['clinical_vec'].dtype}")
     print(f"Time to event: {batch['time'][0].item()}")
     print(f"Progression event: {batch['event'][0].item()}")
-
     print("=" * 40)
 
 

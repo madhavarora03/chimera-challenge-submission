@@ -42,3 +42,14 @@ def encode_clinical(cd: Dict[str, Union[str, int, float]]) -> Tensor:
             categorical.append(mapping[value])
 
     return torch.tensor([age, instills] + categorical, dtype=torch.float)
+
+def chimera_collate_fn(batch):
+    batch_dict = {
+        "pid": [item["pid"] for item in batch],
+        "hist_patches": torch.stack([item["hist_patches"] for item in batch]),  # [B, N, D]
+        "rna_vec": torch.stack([item["rna_vec"] for item in batch]),
+        "clinical_vec": torch.stack([item["clinical_vec"] for item in batch]),
+        "time": torch.tensor([item["time"] for item in batch], dtype=torch.float),
+        "event": torch.tensor([item["event"] for item in batch], dtype=torch.long),
+    }
+    return batch_dict
