@@ -1,70 +1,100 @@
 import os
+
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.utils
+from pycox.models.loss import CoxPHLoss
 from sklearn.model_selection import StratifiedKFold
 from sksurv.metrics import concordance_index_censored
+from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
 from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 
 from dataset import ChimeraDataset
 from utils import chimera_collate_fn
 
-from pycox.models.loss import CoxPHLoss
-
 
 class AttentionPooling(nn.Module):
-    def __init__(self, in_dim: int, hidden_dim: int = 256):
+    def __init__(self, in_dim, proj_dim=512):
         super().__init__()
-        self.attention = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
+        self.proj = nn.Linear(in_dim, proj_dim)
+        self.attn = nn.Sequential(
+            nn.LayerNorm(proj_dim),
             nn.ReLU(),
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, 1)
+            nn.Linear(proj_dim, 1)
         )
 
-    def forward(self, x):  # [B, N, D]
-        weights = self.attention(x).squeeze(-1)  # [B, N]
-        attn = torch.softmax(weights, dim=1).unsqueeze(-1)  # [B, N, 1]
-        out = torch.sum(attn * x, dim=1)  # [B, D]
-        return out
+    def forward(self, x):  # [B, N, in_dim]
+        x_proj = self.proj(x)  # [B, N, proj_dim]
+        weights = self.attn(x_proj).squeeze(-1)  # [B, N]
+        attn_weights = torch.softmax(weights, dim=1).unsqueeze(-1)  # [B, N, 1]
+        pooled = torch.sum(attn_weights * x_proj, dim=1)  # [B, proj_dim]
+        return pooled
 
 
 class BaselineModel(nn.Module):
-    def __init__(self, hist_dim=1026, rna_dim=19359, clinical_dim=13):
+    def __init__(self, hist_dim=1026, rna_dim=19359, clinical_dim=13,
+                 hist_proj_dim=512, hist_feat_dim=256,
+                 rna_feat_dim=512, clinical_feat_dim=64):
         super().__init__()
-        self.attn_pool = AttentionPooling(in_dim=hist_dim)
-        total_input = hist_dim + rna_dim + clinical_dim
 
-        self.backbone = nn.Sequential(
-            nn.Linear(total_input, 1024),
+        # Attention pooling output: [B, hist_proj_dim]
+        self.attn_pool = AttentionPooling(in_dim=hist_dim, proj_dim=hist_proj_dim)
+
+        # Histology encoder: input is pooled from attention
+        self.hist_encoder = nn.Sequential(
+            nn.Linear(hist_proj_dim, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, hist_feat_dim),
+            nn.ReLU()
+        )
+
+        self.rna_encoder = nn.Sequential(
+            nn.Linear(rna_dim, 1024),
             nn.BatchNorm1d(1024),
             nn.ReLU(),
             nn.Dropout(0.4),
+            nn.Linear(1024, rna_feat_dim),
+            nn.ReLU()
+        )
 
-            nn.Linear(1024, 512),
+        self.clinical_encoder = nn.Sequential(
+            nn.Linear(clinical_dim, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Linear(128, clinical_feat_dim)
+        )
+
+        # Total fused features = hist + rna + clinical
+        fusion_input_dim = hist_feat_dim + rna_feat_dim + clinical_feat_dim
+
+        self.fusion = nn.Sequential(
+            nn.Linear(fusion_input_dim, 512),
             nn.BatchNorm1d(512),
             nn.ReLU(),
-            nn.Dropout(0.4),
+            nn.Dropout(0.3),
 
             nn.Linear(512, 256),
-            nn.BatchNorm1d(256),
             nn.ReLU(),
             nn.Dropout(0.3),
 
             nn.Linear(256, 64),
             nn.ReLU(),
+
             nn.Linear(64, 1)
         )
 
     def forward(self, hist_patches, rna_vec, clinical_vec):
-        pooled_hist = self.attn_pool(hist_patches)  # [B, hist_dim]
-        x = torch.cat([pooled_hist, rna_vec, clinical_vec], dim=1)
-        return self.backbone(x).squeeze(-1)  # [B]
+        pooled_hist = self.attn_pool(hist_patches)  # [B, hist_proj_dim]
+        hist_repr = self.hist_encoder(pooled_hist)  # [B, hist_feat_dim]
+        rna_repr = self.rna_encoder(rna_vec)  # [B, rna_feat_dim]
+        clinical_repr = self.clinical_encoder(clinical_vec)  # [B, clinical_feat_dim]
 
-
-from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
-import torch.nn.utils
+        fused = torch.cat([hist_repr, rna_repr, clinical_repr], dim=1)
+        return self.fusion(fused).squeeze(-1)  # [B]
 
 
 def train_model(model, train_loader, val_loader, fold_idx, writer, patience=5, max_epochs=100, device='cpu'):
@@ -178,11 +208,12 @@ def run_cross_validation():
     all_cindices = []
 
     for fold, (train_idx, val_idx) in enumerate(skf.split(np.zeros(len(strat_labels)), strat_labels)):
-        print(f"Fold {fold + 1} | 3A in train: {sum(strat_labels[i]==0 for i in train_idx)} | 3B in train: {sum(strat_labels[i]==1 for i in train_idx)}")
+        print(
+            f"Fold {fold + 1} | 3A in train: {sum(strat_labels[i] == 0 for i in train_idx)} | 3B in train: {sum(strat_labels[i] == 1 for i in train_idx)}")
         train_loader = DataLoader(Subset(dataset, train_idx), batch_size=32, shuffle=True,
-                                   collate_fn=chimera_collate_fn, pin_memory=True)
+                                  collate_fn=chimera_collate_fn, pin_memory=True)
         val_loader = DataLoader(Subset(dataset, val_idx), batch_size=32, shuffle=False,
-                                 collate_fn=chimera_collate_fn, pin_memory=True)
+                                collate_fn=chimera_collate_fn, pin_memory=True)
 
         model = BaselineModel().to(device)
         cindex = train_model(model, train_loader, val_loader, fold, writer, device=device)
