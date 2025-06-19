@@ -1,7 +1,23 @@
 from typing import Dict, Union
 
 import torch
+import os
+import numpy as np
+from torch.backends import cudnn
+import random
 from torch import Tensor
+
+def seed_everything(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    cudnn.deterministic = True
+    cudnn.benchmark = False
+
+    os.environ['PYTHONHASHSEED'] = str(seed)
+
 
 
 def encode_clinical(cd: Dict[str, Union[str, int, float]]) -> Tensor:

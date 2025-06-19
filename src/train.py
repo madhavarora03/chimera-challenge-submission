@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 
 from dataset import ChimeraDataset
-from utils import chimera_collate_fn
+from utils import chimera_collate_fn, seed_everything
 
 
 class AttentionPooling(nn.Module):
@@ -183,6 +183,7 @@ def train_model(model, train_loader, val_loader, fold_idx, writer, patience=5, m
 
 
 def run_cross_validation():
+    seed_everything(42)  # Ensure reproducibility
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"🖥️ Using device: {device}")
 
@@ -203,7 +204,7 @@ def run_cross_validation():
     strat_labels = [0 if pid.startswith("3A") else 1 for pid in patient_ids]
 
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    writer = SummaryWriter(log_dir="runs/attn_baseline_by_cohort")
+    writer = SummaryWriter(log_dir="runs/baseline_model")
 
     all_cindices = []
 
