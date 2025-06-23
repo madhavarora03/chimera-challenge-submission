@@ -27,7 +27,7 @@ Make sure you are in the desired directory where you want the data to be stored.
 
 ## Download dependencies
 To set up the environment, make sure you have the following dependencies:
-- **Python:** Version 3.12
+- **Python:** Version 3.10
 - **CUDA:** Version 12.6 (ensure that your GPU supports this version)
 
 Once the prerequisites are met, follow these steps to set up your environment:
