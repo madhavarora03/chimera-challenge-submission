@@ -52,7 +52,7 @@ def encode_clinical(cd: Dict[str, Union[str, int, float]]) -> Tensor:
     for key, mapping in cat_map.items():
         value = cd.get(key, None)
         if value not in mapping:
-            print(f"⚠️ Warning: Unexpected value `{value}` for key `{key}` — defaulting to 0.")
+            # print(f"⚠️ Warning: Unexpected value `{value}` for key `{key}` — defaulting to 0.")
             categorical.append(0)
         else:
             categorical.append(mapping[value])
