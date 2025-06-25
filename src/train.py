@@ -243,9 +243,9 @@ def run_cross_validation():
 
     for fold, (train_idx, val_idx) in enumerate(skf.split(np.zeros(len(strat_labels)), strat_labels)):
         print(f"Fold {fold + 1}")
-        train_loader = DataLoader(Subset(dataset, train_idx), batch_size=32, shuffle=True, drop_last=True,
+        train_loader = DataLoader(Subset(dataset, train_idx), batch_size=4, shuffle=True, drop_last=True,
                                   collate_fn=chimera_collate_fn, pin_memory=True, num_workers=os.cpu_count())
-        val_loader = DataLoader(Subset(dataset, val_idx), batch_size=32, shuffle=False, drop_last=True,
+        val_loader = DataLoader(Subset(dataset, val_idx), batch_size=4, shuffle=False, drop_last=True,
                                 collate_fn=chimera_collate_fn, pin_memory=True, num_workers=os.cpu_count())
 
         model = BaselineModel().to(device)
