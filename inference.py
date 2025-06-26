@@ -4,10 +4,15 @@ from glob import glob
 import numpy as np
 import openslide
 import tifffile
+import torch
+import torch.nn as nn
+from torchvision import models, transforms
+from PIL import Image
 import random
 
 INPUT_PATH = Path("/input")
 OUTPUT_PATH = Path("/output")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def run():
@@ -26,29 +31,73 @@ def run():
 
 
 def interf0_handler():
-    # Load images
     tissue_mask = load_slide_image(INPUT_PATH / "images/tissue-mask")
-    wsi = load_slide_image(INPUT_PATH / "images/bladder-cancer-tissue-biopsy-wsi")
+    wsi_slide = load_slide(INPUT_PATH / "images/bladder-cancer-tissue-biopsy-wsi")
 
-    # Load JSONs
     rna = load_json_file(INPUT_PATH / "bulk-rna-seq-bladder-cancer.json")
     clinical = load_json_file(INPUT_PATH / "chimera-clinical-data-of-bladder-cancer-recurrence-patients.json")
 
-    # Debug
-    print("=+=" * 10)
-    print("Tissue mask shape:", tissue_mask.shape)
-    print("WSI shape:", wsi.shape)
-    print("RNA keys:", list(rna.keys()))
-    print("Clinical keys:", list(clinical.keys()))
-    print("=+=" * 10)
-
     _show_torch_cuda_info()
 
-    # Dummy prediction
+    patch_features_with_coords = extract_patch_features(wsi_slide)
+
+    print(f"✅ Final patch features shape: {patch_features_with_coords.shape}")
+
     output = round(random.uniform(0, 80), 1)
     write_json_file(OUTPUT_PATH / "likelihood-of-bladder-cancer-recurrence.json", output)
 
     return 0
+
+
+def rename_state_dict_keys(state_dict):
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        k_new = k.replace("norm.1", "norm1").replace("norm.2", "norm2")\
+                 .replace("conv.1", "conv1").replace("conv.2", "conv2")
+        new_state_dict[k_new] = v
+    return new_state_dict
+
+
+def extract_patch_features(slide, patch_size=224, stride=224, max_patches=512):
+    width, height = slide.dimensions
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ])
+
+    model = models.densenet121(weights=None)
+    state_dict = torch.load("resources/densenet121-a639ec97.pth", map_location="cpu")
+    state_dict = rename_state_dict_keys(state_dict)
+    model.load_state_dict(state_dict)
+    model.classifier = nn.Identity()
+    model.to(device)
+    model.eval()
+
+    features = []
+    coords = []
+
+    for y in range(0, height, stride):
+        for x in range(0, width, stride):
+            patch = slide.read_region((x, y), 0, (patch_size, patch_size)).convert("RGB")
+            patch_tensor = transform(patch).unsqueeze(0).to(device)
+            try:
+                with torch.no_grad():
+                    feat = model(patch_tensor).cpu().numpy()
+                features.append(feat[0])
+                coords.append([x, y])
+            except Exception as e:
+                print(f"⚠️ Skipping patch at ({x}, {y}): {e}")
+            if len(features) >= max_patches:
+                break
+        if len(features) >= max_patches:
+            break
+
+    features = np.array(features)
+    coords = np.array(coords)
+
+    assert features.shape[0] == coords.shape[0], "Mismatch between features and coordinates count!"
+    return np.concatenate([features, coords], axis=1)
 
 
 def get_interface_key():
@@ -89,8 +138,14 @@ def load_slide_image(location):
         raise RuntimeError(f"Failed to load image {file} using OpenSlide or tifffile: {e}")
 
 
+def load_slide(location):
+    files = glob(str(location / "*"))
+    if not files:
+        raise FileNotFoundError(f"No slide image found in {location}")
+    return openslide.OpenSlide(files[0])
+
+
 def _show_torch_cuda_info():
-    import torch
     print("=+=" * 10)
     print("Torch CUDA available:", (avail := torch.cuda.is_available()))
     if avail:
