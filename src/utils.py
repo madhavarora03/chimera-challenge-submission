@@ -22,42 +22,47 @@ def seed_everything(seed=42):
 
 def encode_clinical(cd: Dict[str, Union[str, int, float]]) -> Tensor:
     """
-    Encodes clinical categorical and numerical features into a flat tensor.
+    One-hot encodes clinical categorical features and appends normalized numerical features.
 
     Args:
         cd (Dict[str, Union[str, int, float]]): Clinical dictionary loaded from _CD.json.
 
     Returns:
-        Tensor: A 1D tensor containing encoded clinical features.
+        Tensor: A 1D tensor containing one-hot encoded clinical features.
     """
     cat_map = {
-        "sex": {"Male": 0, "Female": 1},
-        "smoking": {"No": 0, "Yes": 1},
-        "tumor": {"Primary": 0, "Recurrence": 1},
-        "stage": {"TaHG": 0, "T1HG": 1, "T2HG": 2},
-        "substage": {"T1m": 0, "T1e": 1},
-        "grade": {"G2": 0, "G3": 1},
-        "reTUR": {"No": 0, "Yes": 1},
-        "LVI": {"No": 0, "Yes": 1},
-        "variant": {"UCC": 0, "UCC + Variant": 1},
-        "EORTC": {"High risk": 0, "Highest risk": 1},
-        "BRS": {"BRS1": 0, "BRS2": 1, "BRS3": 2}
+        "sex": ["Male", "Female"],
+        "smoking": ["No", "Yes"],
+        "tumor": ["Primary", "Recurrence"],
+        "stage": ["TaHG", "T1HG", "T2HG"],
+        "substage": ["T1m", "T1e"],
+        "grade": ["G2", "G3"],
+        "reTUR": ["No", "Yes"],
+        "LVI": ["No", "Yes"],
+        "variant": ["UCC", "UCC + Variant"],
+        "EORTC": ["High risk", "Highest risk"],
+        "BRS": ["BRS1", "BRS2", "BRS3"]
     }
 
-    # Safe numeric encoding
-    age = float(cd.get("age", 0.0))
-    instills = int(cd.get("no_instillations", -1))
-
-    categorical = []
-    for key, mapping in cat_map.items():
+    # One-hot encoding categorical variables
+    one_hot = []
+    for key, options in cat_map.items():
+        vec = [0] * len(options)
         value = cd.get(key, None)
-        if value not in mapping:
-            # print(f"⚠️ Warning: Unexpected value `{value}` for key `{key}` — defaulting to 0.")
-            categorical.append(0)
+        if value in options:
+            vec[options.index(value)] = 1
         else:
-            categorical.append(mapping[value])
+            vec[0] = 1  # Default to first class if unknown
+            # print(f"⚠️ Warning: Unexpected value `{value}` for key `{key}` — defaulting to {options[0]}.")
+        one_hot.extend(vec)
 
-    return torch.tensor([age, instills] + categorical, dtype=torch.float)
+    # Append numerical features (you can normalize if needed)
+    age = float(cd.get("age", 0.0))
+    instills = float(cd.get("no_instillations", -1))
+    numerical = [age, instills]
+
+    return torch.tensor(numerical + one_hot, dtype=torch.float)
+
 
 def chimera_collate_fn(batch):
     batch_dict = {
