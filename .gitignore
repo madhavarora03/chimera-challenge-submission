@@ -5,7 +5,7 @@
 /features/*
 !/features/.gitkeep
 .venv
-src/__pycache__
+__pycache__
 runs
 checkpoints
 *.log
