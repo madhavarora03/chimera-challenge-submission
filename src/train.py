@@ -132,7 +132,8 @@ def train_pipeline(samples, patient_ids, device='cpu'):
     y_sel = y_struct[idx]
 
     # 🧠 Stratified 5-Fold CV
-    strat_labels = [int(e)*10000 + int(t) for e,t in zip(y_sel['event'], y_sel['time'])]
+    cohorts = [0 if pid.startswith("3A") else 1 for pid in np.array(patient_ids)[idx]]
+    strat_labels = [f"{int(e)}_{c}" for e, c in zip(y_sel['event'], cohorts)]
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
     model = build_model(X_sel.shape[1], hidden_dim=224, num_experts=3, lr=2e-4)
