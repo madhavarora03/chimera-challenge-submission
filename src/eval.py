@@ -3,7 +3,6 @@ import numpy as np
 from typing import List
 from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import StandardScaler
-from sklearn.ensemble import RandomForestClassifier
 
 import torch
 import torch.nn as nn
@@ -16,6 +15,25 @@ from pycox.evaluation import EvalSurv
 
 from dataset import ChimeraDataset
 from utils import chimera_collate_fn, seed_everything
+
+# -------------------- Attention DeepSurv --------------------
+
+class AttentionDeepSurv(nn.Module):
+    def __init__(self, in_features, hidden_dim, dropout):
+        super().__init__()
+        assert hidden_dim % 4 == 0, "hidden_dim must be divisible by 4 for 4 heads"
+        self.embedding = nn.Linear(in_features, hidden_dim)
+        self.attn = nn.MultiheadAttention(hidden_dim, num_heads=4, batch_first=True)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim, 64), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(64, 1)
+        )
+
+    def forward(self, x):
+        x = x.unsqueeze(1)
+        x = self.embedding(x)
+        attn_output, _ = self.attn(x, x, x)
+        return self.mlp(attn_output.squeeze(1))
 
 # -------------------- Feature Pooling --------------------
 
@@ -32,7 +50,6 @@ class TopKAttentionPooling(nn.Module):
         topk = torch.topk(weights, self.k, dim=0).indices
         selected = x[topk]
         return selected.mean(dim=0)
-
 
 def extract_patient_features(dataset: ChimeraDataset, device='cpu') -> List[dict]:
     dataloader = DataLoader(dataset, batch_size=1, collate_fn=chimera_collate_fn)
@@ -58,68 +75,37 @@ def extract_patient_features(dataset: ChimeraDataset, device='cpu') -> List[dict
             })
     return samples
 
-# -------------------- DeepSurv Model --------------------
+# -------------------- Training Function --------------------
 
-class AttentionDeepSurv(nn.Module):
-    def __init__(self, in_features, hidden_dim=224, dropout=0.36573746975198096):
-        super().__init__()
-        assert hidden_dim % 4 == 0, "hidden_dim must be divisible by 4 for 4 heads"
-        self.embedding = nn.Linear(in_features, hidden_dim)
-        self.attn = nn.MultiheadAttention(hidden_dim, num_heads=4, batch_first=True)
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden_dim, 64), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(64, 1)
-        )
-
-    def forward(self, x):
-        x = x.unsqueeze(1)
-        x = self.embedding(x)
-        attn_output, _ = self.attn(x, x, x)
-        return self.mlp(attn_output.squeeze(1))
-
-
-def train_pipeline(samples: List[dict], patient_ids: List[str], device='cpu'):
+def train_attention_deepsurv(samples: List[dict], patient_ids: List[str], best_params, device='cpu'):
     X = np.stack([s['x'] for s in samples])
-    y_event = np.array([s['event'] for s in samples])
     y_struct = np.array([(bool(s['event']), s['time']) for s in samples],
                         dtype=[("event", "?"), ("time", "<f8")])
 
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-
-    print("🌲 Training Random Forest for event prediction...")
-    rf = RandomForestClassifier(n_estimators=100, random_state=42)
-    rf.fit(X_scaled, y_event)
-
-    preds = rf.predict(X_scaled)
-    selected_idx = np.where(preds == 1)[0]
-
-    print(f"✅ Selected {len(selected_idx)} patients predicted with event")
-    X_sel = X[selected_idx]
-    y_sel = y_struct[selected_idx]
-
+    cohorts = [0 if pid.startswith("3A") else 1 for pid in patient_ids]
+    strat_labels = [f"{c}_{int(s['time'])}" for c, s in zip(cohorts, samples)]
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    strat_labels = [int(e)*10000 + int(t) for e, t in zip(y_sel['event'], y_sel['time'])]
 
-    cindices = []
     os.makedirs("checkpoints", exist_ok=True)
+    cindices = []
 
-    for fold, (train_idx, val_idx) in enumerate(skf.split(X_sel, strat_labels)):
+    for fold, (train_idx, val_idx) in enumerate(skf.split(X, strat_labels)):
         print(f"\n🌀 Fold {fold + 1} -------------------------")
-        X_train, X_val = X_sel[train_idx], X_sel[val_idx]
-        y_train, y_val = y_sel[train_idx], y_sel[val_idx]
+        X_train, X_val = X[train_idx], X[val_idx]
+        y_train, y_val = y_struct[train_idx], y_struct[val_idx]
 
-        X_train_scaled = scaler.fit_transform(X_train)
-        X_val_scaled = scaler.transform(X_val)
+        scaler = StandardScaler()
+        X_train_scaled = np.ascontiguousarray(scaler.fit_transform(X_train))
+        X_val_scaled = np.ascontiguousarray(scaler.transform(X_val))
 
-        durations_train = y_train['time'].copy()
-        events_train = y_train['event'].copy()
-        durations_val = y_val['time'].copy()
-        events_val = y_val['event'].copy()
+        durations_train = y_train["time"].copy()
+        events_train = y_train["event"].copy()
+        durations_val = y_val["time"].copy()
+        events_val = y_val["event"].copy()
 
-        net = AttentionDeepSurv(in_features=X.shape[1], hidden_dim=224, dropout=0.3657)
+        net = AttentionDeepSurv(X.shape[1], best_params['hidden_dim'], best_params['dropout'])
         model = CoxPH(net, tt.optim.Adam)
-        model.optimizer.set_lr(0.00020292719266061987)
+        model.optimizer.set_lr(best_params['lr'])
 
         model.fit(X_train_scaled, (durations_train, events_train),
                   batch_size=64,
@@ -129,9 +115,9 @@ def train_pipeline(samples: List[dict], patient_ids: List[str], device='cpu'):
 
         model.compute_baseline_hazards()
 
-        path = f"checkpoints/attn_deepsurv_rf_fold_{fold + 1}.pt"
-        model.save_net(path)
-        print(f"💾 Saved model checkpoint: {path}")
+        model_path = f"checkpoints/attn_deepsurv_fold_{fold + 1}.pt"
+        torch.save(model.net.state_dict(), model_path)
+        print(f"💾 Saved model checkpoint: {model_path}")
 
         surv = model.predict_surv_df(X_val_scaled)
         ev = EvalSurv(surv, durations_val, events_val, censor_surv='km')
@@ -139,13 +125,19 @@ def train_pipeline(samples: List[dict], patient_ids: List[str], device='cpu'):
         print(f"✅ Fold {fold + 1} C-Index: {cindex:.4f}")
         cindices.append(cindex)
 
-    print(f"\n🔥 Mean C-Index (Filtered DeepSurv): {np.mean(cindices):.4f}")
+    print(f"\n🔥 Mean C-Index (Attention DeepSurv): {np.mean(cindices):.4f}")
 
 # -------------------- Main --------------------
 
 def main():
     seed_everything(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    best_params = {
+        "hidden_dim": 224,
+        "dropout": 0.36573746975198096,
+        "lr": 0.00020292719266061987,
+    }
 
     patient_ids = sorted([pid for pid in os.listdir("data") if pid not in [".gitkeep", "task3_quality_control.csv"]])
     dataset = ChimeraDataset(
@@ -159,8 +151,8 @@ def main():
     print("📦 Extracting patient features...")
     samples = extract_patient_features(dataset, device=device)
 
-    print("📊 Training event classifier + survival model...")
-    train_pipeline(samples, patient_ids=patient_ids, device=device)
+    print("📊 Training Attention DeepSurv (CoxPH) model...")
+    train_attention_deepsurv(samples, patient_ids=patient_ids, best_params=best_params, device=device)
 
 if __name__ == "__main__":
     main()
