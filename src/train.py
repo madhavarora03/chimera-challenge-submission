@@ -21,9 +21,7 @@ class TopKAttentionPooling(nn.Module):
     def __init__(self, dim, k=10):
         super().__init__()
         self.k = k
-        self.attn = nn.Sequential(
-            nn.Linear(dim, 128), nn.ReLU(), nn.Linear(128, 1)
-        )
+        self.attn = nn.Sequential(nn.Linear(dim, 128), nn.ReLU(), nn.Linear(128, 1))
 
     def forward(self, x):
         weights = self.attn(x).squeeze(-1)
@@ -52,65 +50,68 @@ def extract_patient_features(dataset: ChimeraDataset, device='cpu') -> List[dict
     return samples
 
 # -------------------- Model Components --------------------
-class ResidualBlock(nn.Module):
-    def __init__(self, in_features, out_features, dropout=0.3):
-        super().__init__()
-        self.fc1 = nn.Linear(in_features, out_features)
-        self.bn1 = nn.BatchNorm1d(out_features)
-        self.fc2 = nn.Linear(out_features, out_features)
-        self.bn2 = nn.BatchNorm1d(out_features)
-        self.drop = nn.Dropout(dropout)
-        self.shortcut = nn.Linear(in_features, out_features) if in_features != out_features else nn.Identity()
-
-    def forward(self, x):
-        identity = self.shortcut(x)
-        out = F.relu(self.bn1(self.fc1(x)))
-        out = self.drop(out)
-        out = self.bn2(self.fc2(out))
-        out += identity
-        return F.relu(out)
-
 class ExpertNet(nn.Module):
-    def __init__(self, dim, hidden_dim):
+    def __init__(self, input_dim, hidden_dim):
         super().__init__()
-        self.res1 = ResidualBlock(dim, hidden_dim)
-        self.res2 = ResidualBlock(hidden_dim, hidden_dim)
-        self.out = nn.Linear(hidden_dim, 1)
-
-    def forward(self, x):
-        x = self.res1(x)
-        x = self.res2(x)
-        return self.out(x)
-
-class GatingNet(nn.Module):
-    def __init__(self, dim, num_experts):
-        super().__init__()
-        self.gate = nn.Sequential(
-            nn.Linear(dim, 64), nn.ReLU(), nn.Linear(64, num_experts), nn.Softmax(dim=1)
+        self.model = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(hidden_dim, 1)
         )
 
     def forward(self, x):
-        return self.gate(x)
+        return self.model(x)
 
-class MoEDeepSurv(nn.Module):
-    def __init__(self, dim, hidden_dim=128, num_experts=3):
+class GatingNet(nn.Module):
+    def __init__(self, input_dim, num_experts):
         super().__init__()
-        self.experts = nn.ModuleList([ExpertNet(dim, hidden_dim) for _ in range(num_experts)])
-        self.gate = GatingNet(dim, num_experts)
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, num_experts),
+            nn.Softmax(dim=1)
+        )
 
     def forward(self, x):
-        ex_out = torch.stack([e(x).squeeze(-1) for e in self.experts], dim=1)
-        gw = self.gate(x)
-        return (ex_out * gw).sum(dim=1, keepdim=True)
+        return self.net(x)
 
-def build_model(input_dim, hidden_dim=128, num_experts=3, lr=1e-3):
-    net = MoEDeepSurv(input_dim, hidden_dim, num_experts)
+class MoMoEDeepSurv(nn.Module):
+    def __init__(self, full_dim, splits, hidden_dim=128):
+        super().__init__()
+        self.splits = splits  # (hist_dim, rna_dim, clin_dim)
+        self.experts = nn.ModuleList([
+            ExpertNet(s, hidden_dim) for s in splits
+        ])
+        self.gate = GatingNet(full_dim, len(splits))
+
+    def forward(self, x):
+        h_dim, r_dim, c_dim = self.splits
+        hist = x[:, :h_dim]
+        rna = x[:, h_dim:h_dim + r_dim]
+        clin = x[:, -c_dim:]
+
+        expert_inputs = [hist, rna, clin]
+        expert_outputs = [e(inp).squeeze(-1) for e, inp in zip(self.experts, expert_inputs)]
+        expert_outputs = torch.stack(expert_outputs, dim=1)  # (B, num_experts)
+
+        gate_weights = self.gate(x)  # (B, num_experts)
+        out = (expert_outputs * gate_weights).sum(dim=1, keepdim=True)
+        return out
+
+def build_model(input_dim, splits, hidden_dim=128, lr=1e-3):
+    net = MoMoEDeepSurv(input_dim, splits, hidden_dim)
     model = CoxPH(net, optimizer=torch.optim.Adam)
     model.optimizer.set_lr(lr)
     return model
 
 # -------------------- Training Pipeline --------------------
-def train_pipeline(samples, patient_ids, device='cpu'):
+def train_pipeline(samples, patient_ids, modality_splits, device='cpu'):
     X = np.stack([s['x'] for s in samples])
     y_struct = np.array([(bool(s['event']), s['time']) for s in samples],
                         dtype=[("event","?"),("time","<f8")])
@@ -118,12 +119,11 @@ def train_pipeline(samples, patient_ids, device='cpu'):
     scaler = StandardScaler()
     X_scaled = np.ascontiguousarray(scaler.fit_transform(X))
 
-    # 🧠 Stratified 5-Fold CV
     cohorts = [0 if pid.startswith("3A") else 1 for pid in patient_ids]
     strat_labels = [f"{int(e)}_{c}" for e, c in zip(y_struct['event'].astype(int), cohorts)]
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
-    model = build_model(X_scaled.shape[1], hidden_dim=224, num_experts=3, lr=2e-4)
+    model = build_model(X_scaled.shape[1], modality_splits, hidden_dim=224, lr=2e-4)
     cindices = []
     os.makedirs("checkpoints", exist_ok=True)
 
@@ -134,24 +134,25 @@ def train_pipeline(samples, patient_ids, device='cpu'):
         y_train = y_struct[tr].copy()
         y_val = y_struct[val].copy()
 
-        y_train_time = np.ascontiguousarray(y_train['time'])
-        y_train_event = np.ascontiguousarray(y_train['event'])
-        y_val_time = np.ascontiguousarray(y_val['time'])
-        y_val_event = np.ascontiguousarray(y_val['event'])
-
-        model.fit(X_train, (y_train_time, y_train_event),
-                  batch_size=64,
-                  callbacks=[tt.callbacks.EarlyStopping(patience=10)],
-                  val_data=(X_val, (y_val_time, y_val_event)),
-                  verbose=False)
+        model.fit(
+            X_train,
+            (np.ascontiguousarray(y_train['time']), np.ascontiguousarray(y_train['event'])),
+            batch_size=64,
+            callbacks=[tt.callbacks.EarlyStopping(patience=10)],
+            val_data=(X_val, (
+                np.ascontiguousarray(y_val['time']),
+                np.ascontiguousarray(y_val['event'])
+            )),
+            verbose=False
+        )
         model.compute_baseline_hazards()
 
-        path = f"checkpoints/ressurv_moe_fold{fold+1}.pt"
+        path = f"checkpoints/momoe_fold{fold+1}.pt"
         torch.save(model.net.state_dict(), path)
         print("💾 Saved:", path)
 
         surv = model.predict_surv_df(X_val)
-        ev = EvalSurv(surv, y_val_time, y_val_event, censor_surv='km')
+        ev = EvalSurv(surv, y_val['time'], y_val['event'], censor_surv='km')
         ci = ev.concordance_td()
         print("✅ Fold C-Index:", round(ci, 4))
         cindices.append(ci)
@@ -160,14 +161,26 @@ def train_pipeline(samples, patient_ids, device='cpu'):
 
 # -------------------- Main --------------------
 def main():
-    seed_everything(42)
+    seed_everything(123)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     patient_ids = sorted([pid for pid in os.listdir("data") if pid not in [".gitkeep", "task3_quality_control.csv"]])
+    np.random.shuffle(patient_ids)
+
     dataset = ChimeraDataset(patient_ids, "features/features", "features/coordinates", "data", max_patches=1024)
+
     print("📦 Extracting features...")
     samples = extract_patient_features(dataset, device=device)
-    print("🚀 Training ResSurv-MoE DeepSurv...")
-    train_pipeline(samples, patient_ids, device=device)
+
+    # compute modality splits (e.g., hist=1024, rna=1000, clin=16)
+    hist_dim = 1024
+    total_feat_dim = samples[0]['x'].shape[0]
+    rna_clin_dim = total_feat_dim - hist_dim
+    clin_dim = 26  # adjust based on your clinical vector size
+    rna_dim = rna_clin_dim - clin_dim
+    splits = (hist_dim, rna_dim, clin_dim)
+
+    print("🚀 Training MoMoE-DeepSurv...")
+    train_pipeline(samples, patient_ids, splits, device=device)
 
 if __name__ == "__main__":
     main()
