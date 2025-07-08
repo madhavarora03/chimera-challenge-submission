@@ -3,7 +3,6 @@ import numpy as np
 from typing import List
 from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import StandardScaler
-from sklearn.ensemble import RandomForestClassifier
 
 import torch
 import torch.nn as nn
@@ -115,39 +114,26 @@ def train_pipeline(samples, patient_ids, device='cpu'):
     X = np.stack([s['x'] for s in samples])
     y_struct = np.array([(bool(s['event']), s['time']) for s in samples],
                         dtype=[("event","?"),("time","<f8")])
-    y_event = y_struct['event'].astype(int)
 
     scaler = StandardScaler()
     X_scaled = np.ascontiguousarray(scaler.fit_transform(X))
 
-    # 🪵 Step 1: Train Random Forest for event prediction
-    print("🌲 Training RF for event prediction...")
-    rf = RandomForestClassifier(n_estimators=100, random_state=42)
-    rf.fit(X_scaled, y_event)
-    preds = rf.predict(X_scaled)
-    idx = np.where(preds == 1)[0]
-    print(f"✅ {len(idx)} patients selected.")
-
-    X_sel = X_scaled[idx]
-    y_sel = y_struct[idx]
-
     # 🧠 Stratified 5-Fold CV
-    cohorts = [0 if pid.startswith("3A") else 1 for pid in np.array(patient_ids)[idx]]
-    strat_labels = [f"{int(e)}_{c}" for e, c in zip(y_sel['event'], cohorts)]
+    cohorts = [0 if pid.startswith("3A") else 1 for pid in patient_ids]
+    strat_labels = [f"{int(e)}_{c}" for e, c in zip(y_struct['event'].astype(int), cohorts)]
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
-    model = build_model(X_sel.shape[1], hidden_dim=224, num_experts=3, lr=2e-4)
+    model = build_model(X_scaled.shape[1], hidden_dim=224, num_experts=3, lr=2e-4)
     cindices = []
     os.makedirs("checkpoints", exist_ok=True)
 
-    for fold, (tr, val) in enumerate(skf.split(X_sel, strat_labels)):
+    for fold, (tr, val) in enumerate(skf.split(X_scaled, strat_labels)):
         print(f"\n🌀 Fold {fold+1}")
-        X_train = np.ascontiguousarray(X_sel[tr])
-        X_val = np.ascontiguousarray(X_sel[val])
-        y_train = y_sel[tr].copy()
-        y_val = y_sel[val].copy()
+        X_train = np.ascontiguousarray(X_scaled[tr])
+        X_val = np.ascontiguousarray(X_scaled[val])
+        y_train = y_struct[tr].copy()
+        y_val = y_struct[val].copy()
 
-        # Fix for non-contiguous structured array slices
         y_train_time = np.ascontiguousarray(y_train['time'])
         y_train_event = np.ascontiguousarray(y_train['event'])
         y_val_time = np.ascontiguousarray(y_val['time'])
@@ -174,7 +160,7 @@ def train_pipeline(samples, patient_ids, device='cpu'):
 
 # -------------------- Main --------------------
 def main():
-    seed_everything(123)
+    seed_everything(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     patient_ids = sorted([pid for pid in os.listdir("data") if pid not in [".gitkeep", "task3_quality_control.csv"]])
     dataset = ChimeraDataset(patient_ids, "features/features", "features/coordinates", "data", max_patches=1024)
