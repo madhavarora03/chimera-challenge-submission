@@ -1,3 +1,4 @@
+# -------------------- FULL MATCHED INFERENCE SCRIPT --------------------
 from pathlib import Path
 import json
 from glob import glob
@@ -10,320 +11,127 @@ from torchvision import models, transforms
 from PIL import Image
 import random
 
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+import torchtuples as tt
+from pycox.models import CoxPH
+from pycox.evaluation import EvalSurv
+
 INPUT_PATH = Path("/input")
 OUTPUT_PATH = Path("/output")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def encode_clinical(cd):
     """
-    Encodes clinical categorical and numerical features into a flat tensor.
+    One-hot encodes clinical categorical features and appends normalized numerical features.
 
     Args:
         cd (Dict[str, Union[str, int, float]]): Clinical dictionary loaded from _CD.json.
 
     Returns:
-        Tensor: A 1D tensor containing encoded clinical features.
+        Tensor: A 1D tensor containing one-hot encoded clinical features.
     """
     cat_map = {
-        "sex": {"Male": 0, "Female": 1},
-        "smoking": {"No": 0, "Yes": 1},
-        "tumor": {"Primary": 0, "Recurrence": 1},
-        "stage": {"TaHG": 0, "T1HG": 1, "T2HG": 2},
-        "substage": {"T1m": 0, "T1e": 1},
-        "grade": {"G2": 0, "G3": 1},
-        "reTUR": {"No": 0, "Yes": 1},
-        "LVI": {"No": 0, "Yes": 1},
-        "variant": {"UCC": 0, "UCC + Variant": 1},
-        "EORTC": {"High risk": 0, "Highest risk": 1},
-        "BRS": {"BRS1": 0, "BRS2": 1, "BRS3": 2}
+        "sex": ["Male", "Female"],
+        "smoking": ["No", "Yes"],
+        "tumor": ["Primary", "Recurrence"],
+        "stage": ["TaHG", "T1HG", "T2HG"],
+        "substage": ["T1m", "T1e"],
+        "grade": ["G2", "G3"],
+        "reTUR": ["No", "Yes"],
+        "LVI": ["No", "Yes"],
+        "variant": ["UCC", "UCC + Variant"],
+        "EORTC": ["High risk", "Highest risk"],
+        "BRS": ["BRS1", "BRS2", "BRS3"]
     }
 
-    # Safe numeric encoding
-    age = float(cd.get("age", 0.0))
-    instills = int(cd.get("no_instillations", -1))
-
-    categorical = []
-    for key, mapping in cat_map.items():
+    # One-hot encoding categorical variables
+    one_hot = []
+    for key, options in cat_map.items():
+        vec = [0] * len(options)
         value = cd.get(key, None)
-        if value not in mapping:
-            # print(f"⚠️ Warning: Unexpected value `{value}` for key `{key}` — defaulting to 0.")
-            categorical.append(0)
+        if value in options:
+            vec[options.index(value)] = 1
         else:
-            categorical.append(mapping[value])
+            vec[0] = 1  # Default to first class if unknown
+            # print(f"⚠️ Warning: Unexpected value `{value}` for key `{key}` — defaulting to {options[0]}.")
+        one_hot.extend(vec)
 
-    return torch.tensor([age, instills] + categorical, dtype=torch.float)
+    # Append numerical features (you can normalize if needed)
+    age = float(cd.get("age", 0.0))
+    instills = float(cd.get("no_instillations", -1))
+    numerical = [age, instills]
 
+    return torch.tensor(numerical + one_hot, dtype=torch.float)
 
-class AttentionPooling(nn.Module):
-    def __init__(self, in_dim, proj_dim=1024):
+class TopKAttentionPooling(nn.Module):
+    def __init__(self, dim, k=10):
         super().__init__()
-        self.proj = nn.Linear(in_dim, proj_dim)
-        self.attn = nn.Sequential(
-            nn.LayerNorm(proj_dim),
-            nn.ReLU(),
-            nn.Linear(proj_dim, 1)
-        )
+        self.k = k
+        self.attn = nn.Sequential(nn.Linear(dim, 128), nn.ReLU(), nn.Linear(128, 1))
 
     def forward(self, x):
-        x_proj = self.proj(x)
-        weights = self.attn(x_proj).squeeze(-1)
-        attn_weights = torch.softmax(weights, dim=1).unsqueeze(-1)
-        pooled = torch.sum(attn_weights * x_proj, dim=1)
-        return pooled
+        weights = self.attn(x).squeeze(-1)
+        topk = torch.topk(weights, self.k, dim=0).indices
+        return x[topk].mean(dim=0)
 
-class ResidualBlock(nn.Module):
-    def __init__(self, dim):
+class ExpertNet(nn.Module):
+    def __init__(self, input_dim, hidden_dim):
         super().__init__()
-        self.block = nn.Sequential(
-            nn.Linear(dim, dim),
-            nn.BatchNorm1d(dim),
-            nn.ReLU(),
-            nn.Dropout(0.4),
-            nn.Linear(dim, dim),
-            nn.BatchNorm1d(dim),
-        )
-        self.relu = nn.ReLU()
-
-    def forward(self, x):
-        return self.relu(x + self.block(x))
-
-class BaselineEncoder(nn.Module):
-    def __init__(self, hist_dim=1026, rna_dim=19359, clinical_dim=13,
-                 hist_proj_dim=1024, hist_feat_dim=512,
-                 rna_feat_dim=1024, clinical_feat_dim=128):
-        super().__init__()
-        self.attn_pool = AttentionPooling(hist_dim, hist_proj_dim)
-
-        self.hist_encoder = nn.Sequential(
-            nn.Linear(hist_proj_dim, 1024),
-            nn.BatchNorm1d(1024),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            ResidualBlock(1024),
-            nn.Linear(1024, hist_feat_dim),
-            nn.ReLU()
-        )
-
-        self.rna_bottleneck = nn.Sequential(
-            nn.Linear(rna_dim, 4096),
-            nn.ReLU(),
-            nn.Linear(4096, 2048),
-            nn.ReLU()
-        )
-
-        self.rna_encoder = nn.Sequential(
-            nn.Linear(2048, 1024),
-            nn.BatchNorm1d(1024),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            ResidualBlock(1024),
-            nn.Linear(1024, rna_feat_dim),
-            nn.ReLU()
-        )
-
-        self.clinical_encoder = nn.Sequential(
-            nn.Linear(clinical_dim, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            nn.Dropout(0.4),
-            nn.Linear(256, clinical_feat_dim)
-        )
-
-        self.out_dim = hist_feat_dim + rna_feat_dim + clinical_feat_dim
-
-    def forward(self, hist_patches, rna_vec, clinical_vec):
-        pooled_hist = self.attn_pool(hist_patches)
-        hist_repr = self.hist_encoder(pooled_hist)
-        rna_bottled = self.rna_bottleneck(rna_vec)
-        rna_repr = self.rna_encoder(rna_bottled)
-        clinical_repr = self.clinical_encoder(clinical_vec)
-        return torch.cat([hist_repr, rna_repr, clinical_repr], dim=1)
-
-class ProgressionClassifier(nn.Module):
-    def __init__(self, input_dim):
-        super().__init__()
-        self.classifier = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.ReLU(),
-            nn.Dropout(0.4),
-            nn.Linear(256, 64),
+        self.model = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.3),
-            nn.Linear(64, 2)  # logits for 2 classes
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(hidden_dim, 1)
         )
 
     def forward(self, x):
-        return self.classifier(x)
+        return self.model(x)
 
-class ProgressionEmbedding(nn.Module):
-    def __init__(self, num_classes=2, embed_dim=32):
+class GatingNet(nn.Module):
+    def __init__(self, input_dim, num_experts):
         super().__init__()
-        self.embedding = nn.Embedding(num_classes, embed_dim)
-
-    def forward(self, class_logits):
-        class_probs = torch.softmax(class_logits, dim=1)
-        pred_class = class_probs.argmax(dim=1)
-        return self.embedding(pred_class)
-
-class SurvivalRegressor(nn.Module):
-    def __init__(self, input_dim):
-        super().__init__()
-        self.regressor = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.BatchNorm1d(256),
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 64),
             nn.ReLU(),
-            nn.Dropout(0.4),
-            ResidualBlock(256),
-            nn.Linear(256, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1)
+            nn.Linear(64, num_experts),
+            nn.Softmax(dim=1)
         )
 
     def forward(self, x):
-        return self.regressor(x).squeeze(-1)
+        return self.net(x)
 
-class TwoStageModel(nn.Module):
-    def __init__(self, hist_dim=1026, rna_dim=19359, clinical_dim=13):
+class MoMoEDeepSurv(nn.Module):
+    def __init__(self, full_dim, splits, hidden_dim=224):
         super().__init__()
-        self.encoder = BaselineEncoder(hist_dim, rna_dim, clinical_dim)
-        self.classifier = ProgressionClassifier(self.encoder.out_dim)
-        self.prog_embed = ProgressionEmbedding()
-        self.survival_regressor = SurvivalRegressor(self.encoder.out_dim + 32)
+        self.splits = splits
+        self.experts = nn.ModuleList([
+            ExpertNet(s, hidden_dim) for s in splits
+        ])
+        self.gate = GatingNet(full_dim, len(splits))
 
-    def forward(self, hist_patches, rna_vec, clinical_vec):
-        features = self.encoder(hist_patches, rna_vec, clinical_vec)
-        class_logits = self.classifier(features)
-        prog_embedding = self.prog_embed(class_logits)
-        surv_input = torch.cat([features, prog_embedding], dim=1)
-        risk_score = self.survival_regressor(surv_input)
-        return class_logits, risk_score
+    def forward(self, x):
+        h_dim, r_dim, c_dim = self.splits
+        hist = x[:, :h_dim]
+        rna = x[:, h_dim:h_dim + r_dim]
+        clin = x[:, -c_dim:]
+        expert_inputs = [hist, rna, clin]
+        expert_outputs = [e(inp).squeeze(-1) for e, inp in zip(self.experts, expert_inputs)]
+        expert_outputs = torch.stack(expert_outputs, dim=1)
+        gate_weights = self.gate(x)
+        out = (expert_outputs * gate_weights).sum(dim=1, keepdim=True)
+        return out
 
-def train_model_two_stage(model, train_loader, val_loader, fold_idx, writer, 
-                          lambda_cls=1.0, lambda_surv=1.0, patience=10, max_epochs=100, device='cpu'):
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5, weight_decay=1e-5)
-    scheduler = SequentialLR(
-        optimizer,
-        [LinearLR(optimizer, start_factor=0.1, total_iters=5), CosineAnnealingLR(optimizer, T_max=max_epochs - 5)],
-        milestones=[5]
-    )
-    bce_loss = nn.CrossEntropyLoss()
-    cox_loss = CoxPHLoss()
-
-    best_val_cindex = 0
-    patience_counter = 0
-    os.makedirs("checkpoints", exist_ok=True)
-    best_model_path = f"checkpoints/fold_{fold_idx + 1}_best_2stage.pth"
-
-    for epoch in range(max_epochs):
-        model.train()
-        total_loss = 0
-        skipped_batches = 0
-
-        for batch in train_loader:
-            hist = batch['hist_patches'].to(device)
-            rna = batch['rna_vec'].to(device)
-            clinical = batch['clinical_vec'].to(device)
-            time = batch['time'].to(device).float()
-            event = batch['event'].to(device).float()
-            progression = batch['event'].long().to(device)
-
-            optimizer.zero_grad()
-            class_logits, risk_score = model(hist, rna, clinical)
-            risk_score = torch.clamp(risk_score, min=-30.0, max=30.0)
-
-            loss_cls = bce_loss(class_logits, progression)
-            loss_surv = cox_loss(risk_score, time, event)
-            loss = lambda_cls * loss_cls + lambda_surv * loss_surv
-
-            if not torch.isfinite(loss):
-                skipped_batches += 1
-                continue
-
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            total_loss += loss.item()
-
-        avg_loss = total_loss / max(len(train_loader) - skipped_batches, 1)
-
-        # Validation
-        model.eval()
-        val_preds, val_times, val_events = [], [], []
-        with torch.no_grad():
-            for batch in val_loader:
-                hist = batch['hist_patches'].to(device)
-                rna = batch['rna_vec'].to(device)
-                clinical = batch['clinical_vec'].to(device)
-                _, risk_score = model(hist, rna, clinical)
-                val_preds.extend(risk_score.cpu().numpy())
-                val_times.extend(batch['time'].cpu().numpy())
-                val_events.extend(batch['event'].cpu().numpy())
-
-        val_struct = np.array([(bool(e), t) for e, t in zip(val_events, val_times)], dtype=[('event', '?'), ('time', '<f8')])
-        val_cindex = concordance_index_censored(val_struct['event'], val_struct['time'], -np.array(val_preds))[0]
-
-        writer.add_scalar(f"Fold{fold_idx}/TrainLoss", avg_loss, epoch)
-        writer.add_scalar(f"Fold{fold_idx}/ValCIndex", val_cindex, epoch)
-        print(f"Epoch {epoch + 1:03d} | Fold {fold_idx + 1} | Loss: {avg_loss:.4f} | C-Index: {val_cindex:.4f}")
-
-        scheduler.step()
-        if val_cindex > best_val_cindex:
-            best_val_cindex = val_cindex
-            patience_counter = 0
-            torch.save(model.state_dict(), best_model_path)
-        else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                print(f"Early stopping at epoch {epoch + 1} for fold {fold_idx + 1}")
-                break
-
-    return best_val_cindex
-
-
-
-def run():
-    interface_key = get_interface_key()
-    handler = {
-        (
-            "bladder-cancer-tissue-biopsy-whole-slide-image",
-            "bulk-rna-seq-bladder-cancer",
-            "chimera-clinical-data-of-bladder-cancer-recurrence",
-            "tissue-mask",
-        ): interf0_handler,
-    }[interface_key]
-    return handler()
-
-
-def interf0_handler():
-    tissue_mask = load_slide_image(INPUT_PATH / "images/tissue-mask")
-    wsi_slide = load_slide(INPUT_PATH / "images/bladder-cancer-tissue-biopsy-wsi")
-
-    rna = load_json_file(INPUT_PATH / "bulk-rna-seq-bladder-cancer.json")
-    clinical = load_json_file(INPUT_PATH / "chimera-clinical-data-of-bladder-cancer-recurrence-patients.json")
-
-    _show_torch_cuda_info()
-
-    patch_features_with_coords = extract_patch_features(wsi_slide)
-
-    print(f"✅ Final patch features shape: {patch_features_with_coords.shape}")
-
-    hist_patches = torch.tensor(patch_features_with_coords, dtype=torch.float32).unsqueeze(0).to(device)
-
-    rna_vec = torch.tensor(np.array(list(rna.values())), dtype=torch.float32).unsqueeze(0).to(device)
-    clinical_vec = encode_clinical(clinical).unsqueeze(0).to(device)
-
-    model = TwoStageModel().to(device)
-    model.load_state_dict(torch.load("resources/bs_model.pth", map_location=device))
-    model.eval()
-
-    with torch.no_grad():
-        class_logits, risk_score = model(hist_patches, rna_vec, clinical_vec)
-        likelihood = float(torch.sigmoid(class_logits)[0][1].cpu()) * 100
-
-    write_json_file(OUTPUT_PATH / "likelihood-of-bladder-cancer-recurrence.json", round(likelihood, 1))
-
-    return 0
-
+def build_model(input_dim, splits, hidden_dim=224, lr=1e-3):
+    net = MoMoEDeepSurv(input_dim, splits, hidden_dim)
+    model = CoxPH(net, optimizer=torch.optim.Adam)
+    model.optimizer.set_lr(lr)
+    return model
 
 def rename_state_dict_keys(state_dict):
     new_state_dict = {}
@@ -333,7 +141,6 @@ def rename_state_dict_keys(state_dict):
         new_state_dict[k_new] = v
     return new_state_dict
 
-
 def extract_patch_features(slide, patch_size=224, stride=224, max_patches=512):
     width, height = slide.dimensions
     transform = transforms.Compose([
@@ -341,11 +148,9 @@ def extract_patch_features(slide, patch_size=224, stride=224, max_patches=512):
         transforms.ToTensor(),
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
-
     model = models.densenet121(weights=None)
     state_dict = torch.load("resources/densenet121-a639ec97.pth", map_location=device)
-    state_dict = rename_state_dict_keys(state_dict)
-    model.load_state_dict(state_dict)
+    model.load_state_dict(rename_state_dict_keys(state_dict))
     model.classifier = nn.Identity()
     model.to(device)
     model.eval()
@@ -366,28 +171,58 @@ def extract_patch_features(slide, patch_size=224, stride=224, max_patches=512):
                 break
         if len(features) >= max_patches:
             break
-
     features = np.array(features)
     coords = np.array(coords)
-
     assert features.shape[0] == coords.shape[0], "Mismatch between features and coordinates count!"
     return np.concatenate([features, coords], axis=1)
 
+def interf0_handler():
+    tissue_mask = load_slide_image(INPUT_PATH / "images/tissue-mask")
+    wsi_slide = load_slide(INPUT_PATH / "images/bladder-cancer-tissue-biopsy-wsi")
+    rna = load_json_file(INPUT_PATH / "bulk-rna-seq-bladder-cancer.json")
+    clinical = load_json_file(INPUT_PATH / "chimera-clinical-data-of-bladder-cancer-recurrence-patients.json")
+    _show_torch_cuda_info()
 
-def get_interface_key():
-    inputs = load_json_file(INPUT_PATH / "inputs.json")
-    return tuple(sorted(sv["interface"]["slug"] for sv in inputs))
+    patch_features_with_coords = extract_patch_features(wsi_slide)
+    print(f"✅ Final patch features shape: {patch_features_with_coords.shape}")
 
+    hist_patches = torch.tensor(patch_features_with_coords, dtype=torch.float32).unsqueeze(0).to(device)
+    pooled_feat = TopKAttentionPooling(dim=1024).to(device)(hist_patches.squeeze(0)[:, :-2])
 
-def load_json_file(location):
-    with open(location, "r") as f:
-        return json.load(f)
+    rna_vec = torch.tensor(np.array(list(rna.values())), dtype=torch.float32).to(device)
+    clinical_vec = encode_clinical(clinical).to(device)
+    x = torch.cat([pooled_feat, rna_vec, clinical_vec]).unsqueeze(0).to(device)
 
+    h_dim = pooled_feat.shape[0]
+    r_dim = rna_vec.shape[0]
+    c_dim = clinical_vec.shape[0]
+    input_dim = h_dim + r_dim + c_dim
+    splits = (h_dim, r_dim, c_dim)
 
-def write_json_file(location, content):
-    with open(location, "w") as f:
-        json.dump(content, f, indent=4)
+    model = build_model(input_dim=input_dim, splits=splits)
+    state_dict = torch.load("resources/momoe_fold5.pt", map_location=device)
+    model.net.load_state_dict(state_dict)
+    model.net.to(device)
+    model.net.eval()
 
+    with torch.no_grad():
+        risk_score = model.net(x)
+        likelihood = float(risk_score.item())
+
+    write_json_file(OUTPUT_PATH / "likelihood-of-bladder-cancer-recurrence.json", round(likelihood, 1))
+    return 0
+
+def run():
+    interface_key = get_interface_key()
+    handler = {
+        (
+            "bladder-cancer-tissue-biopsy-whole-slide-image",
+            "bulk-rna-seq-bladder-cancer",
+            "chimera-clinical-data-of-bladder-cancer-recurrence",
+            "tissue-mask",
+        ): interf0_handler,
+    }[interface_key]
+    return handler()
 
 def load_slide_image(location):
     files = glob(str(location / "*"))
@@ -395,7 +230,6 @@ def load_slide_image(location):
         raise FileNotFoundError(f"No image found in {location}")
     file = files[0]
     print(f"Loading image: {file}")
-
     ext = Path(file).suffix.lower()
     if ext in [".svs", ".tif", ".ndpi", ".mrxs"]:
         try:
@@ -404,13 +238,11 @@ def load_slide_image(location):
             return np.array(thumbnail)
         except Exception as e:
             print(f"OpenSlide failed: {e}")
-
     try:
         image = tifffile.imread(file)
         return image
     except Exception as e:
         raise RuntimeError(f"Failed to load image {file} using OpenSlide or tifffile: {e}")
-
 
 def load_slide(location):
     files = glob(str(location / "*"))
@@ -418,6 +250,17 @@ def load_slide(location):
         raise FileNotFoundError(f"No slide image found in {location}")
     return openslide.OpenSlide(files[0])
 
+def get_interface_key():
+    inputs = load_json_file(INPUT_PATH / "inputs.json")
+    return tuple(sorted(sv["interface"]["slug"] for sv in inputs))
+
+def load_json_file(location):
+    with open(location, "r") as f:
+        return json.load(f)
+
+def write_json_file(location, content):
+    with open(location, "w") as f:
+        json.dump(content, f, indent=4)
 
 def _show_torch_cuda_info():
     print("=+=" * 10)
@@ -427,7 +270,6 @@ def _show_torch_cuda_info():
         device = torch.cuda.current_device()
         print("Device properties:", torch.cuda.get_device_properties(device))
     print("=+=" * 10)
-
 
 if __name__ == "__main__":
     raise SystemExit(run())
