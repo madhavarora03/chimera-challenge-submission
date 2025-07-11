@@ -161,7 +161,7 @@ def train_pipeline(samples, patient_ids, modality_splits, device='cpu'):
 
 # -------------------- Main --------------------
 def main():
-    seed_everything(123)
+    seed_everything(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     patient_ids = sorted([pid for pid in os.listdir("data") if pid not in [".gitkeep", "task3_quality_control.csv"]])
     np.random.shuffle(patient_ids)
