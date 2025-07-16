@@ -207,7 +207,7 @@ def interf0_handler():
 
     with torch.no_grad():
         risk_score = model.net(x)
-        likelihood = float(risk_score.item())
+        likelihood = float(torch.sigmoid(risk_score).item()) * 100
 
     write_json_file(OUTPUT_PATH / "likelihood-of-bladder-cancer-recurrence.json", round(likelihood, 1))
     return 0
