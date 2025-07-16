@@ -58,7 +58,7 @@ def encode_clinical(cd):
         one_hot.extend(vec)
 
     # Append numerical features (you can normalize if needed)
-    age = float(cd.get("age", 0.0))
+    age = float(cd.get("age", 0.0)) / 100
     instills = float(cd.get("no_instillations", -1))
     numerical = [age, instills]
 

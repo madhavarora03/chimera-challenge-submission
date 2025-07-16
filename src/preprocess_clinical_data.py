@@ -42,12 +42,11 @@ def normalize_and_update_age(json_root_dir):
         return
 
     df['age'] = pd.to_numeric(df['age'], errors='coerce')
-    scaler = MinMaxScaler()
-    df['age_normalized'] = scaler.fit_transform(df[['age']])
+    df['age_normalized'] = df['age'] / 100
 
     # Step 3: Update original JSON files with normalized age
     updated_count = 0
-    for i, row in df.iterrows():
+    for _, row in df.iterrows():
         patient_id = row['patient_id']
         normalized_age = row['age_normalized']
 
