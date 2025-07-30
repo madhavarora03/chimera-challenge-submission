@@ -1,186 +1,141 @@
 import os
+import json
 import numpy as np
-from typing import List
-from sklearn.model_selection import StratifiedKFold
-from sklearn.preprocessing import StandardScaler
-
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
-
-import torchtuples as tt
-from pycox.models import CoxPH
-from pycox.evaluation import EvalSurv
+from torch.utils.data import DataLoader, Subset
+from sklearn.model_selection import StratifiedKFold
+from sklearn.utils import shuffle
+from sksurv.metrics import concordance_index_censored
+from torch.utils.tensorboard import SummaryWriter
 
 from dataset import ChimeraDataset
-from utils import chimera_collate_fn, seed_everything
+from utils import seed_everything
 
-# -------------------- Attention Pooling --------------------
-class TopKAttentionPooling(nn.Module):
-    def __init__(self, dim, k=10):
+
+def cox_ph_loss(risk, time, event):
+    order = torch.argsort(time, descending=True)
+    risk, event = risk[order], event[order]
+    log_cumsum = torch.logcumsumexp(risk, dim=0)
+    return -torch.mean((risk - log_cumsum)[event == 1])
+
+
+class MLP(nn.Module):
+    def __init__(self, input_dim):
         super().__init__()
-        self.k = k
-        self.attn = nn.Sequential(nn.Linear(dim, 128), nn.ReLU(), nn.Linear(128, 1))
-
-    def forward(self, x):
-        weights = self.attn(x).squeeze(-1)
-        topk = torch.topk(weights, self.k, dim=0).indices
-        return x[topk].mean(dim=0)
-
-# -------------------- Feature Extraction --------------------
-def extract_patient_features(dataset: ChimeraDataset, device='cpu') -> List[dict]:
-    dataloader = DataLoader(dataset, batch_size=1, collate_fn=chimera_collate_fn)
-    pooling = TopKAttentionPooling(dim=1024).to(device)
-    samples = []
-    with torch.no_grad():
-        for batch in dataloader:
-            pid = batch['pid'][0]
-            hist = batch['hist_patches'].squeeze(0).to(device)
-            patch_feats = hist[:, :-2]
-            pooled_feat = pooling(patch_feats)
-
-            rna = batch['rna_vec'].squeeze(0).cpu().numpy()
-            clin = batch['clinical_vec'].squeeze(0).cpu().numpy()
-            time = float(batch['time'][0])
-            event = int(batch['event'][0])
-
-            x = np.concatenate([pooled_feat.cpu().numpy(), rna, clin])
-            samples.append({"pid": pid, "x": x, "time": time, "event": event})
-    return samples
-
-# -------------------- Model Components --------------------
-class ExpertNet(nn.Module):
-    def __init__(self, input_dim, hidden_dim):
-        super().__init__()
-        self.model = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, 512),
             nn.ReLU(),
             nn.Dropout(0.3),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
+            nn.Linear(512, 128),
             nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(hidden_dim, 1)
+            nn.Dropout(0.2),
+            nn.Linear(128, 1)
         )
 
     def forward(self, x):
-        return self.model(x)
+        return self.mlp(x).squeeze(-1)
 
-class GatingNet(nn.Module):
-    def __init__(self, input_dim, num_experts):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, num_experts),
-            nn.Softmax(dim=1)
-        )
 
-    def forward(self, x):
-        return self.net(x)
+def train_model(model, train_loader, val_loader, fold_idx, writer,
+                patience=10, max_epochs=100, device='cpu'):
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    best_val_cindex = 0
+    patience_counter = 0
+    best_model_path = f"checkpoints/fold_{fold_idx + 1}_best_mlp.pth"
 
-class MoMoEDeepSurv(nn.Module):
-    def __init__(self, full_dim, splits, hidden_dim=128):
-        super().__init__()
-        self.splits = splits  # (hist_dim, rna_dim, clin_dim)
-        self.experts = nn.ModuleList([
-            ExpertNet(s, hidden_dim) for s in splits
-        ])
-        self.gate = GatingNet(full_dim, len(splits))
+    for epoch in range(max_epochs):
+        model.train()
+        for batch in train_loader:
+            x = batch['input_vec'].to(device)
+            time = batch['time'].to(device)
+            event = batch['event'].to(device)
 
-    def forward(self, x):
-        h_dim, r_dim, c_dim = self.splits
-        hist = x[:, :h_dim]
-        rna = x[:, h_dim:h_dim + r_dim]
-        clin = x[:, -c_dim:]
+            optimizer.zero_grad()
+            risk = model(x)
+            loss = cox_ph_loss(risk, time, event)
 
-        expert_inputs = [hist, rna, clin]
-        expert_outputs = [e(inp).squeeze(-1) for e, inp in zip(self.experts, expert_inputs)]
-        expert_outputs = torch.stack(expert_outputs, dim=1)  # (B, num_experts)
+            if not torch.isfinite(loss):
+                continue
 
-        gate_weights = self.gate(x)  # (B, num_experts)
-        out = (expert_outputs * gate_weights).sum(dim=1, keepdim=True)
-        return out
+            loss.backward()
+            optimizer.step()
 
-def build_model(input_dim, splits, hidden_dim=128, lr=1e-3):
-    net = MoMoEDeepSurv(input_dim, splits, hidden_dim)
-    model = CoxPH(net, optimizer=torch.optim.Adam)
-    model.optimizer.set_lr(lr)
-    return model
+        # Validation
+        model.eval()
+        val_preds, val_times, val_events = [], [], []
+        with torch.no_grad():
+            for batch in val_loader:
+                x = batch['input_vec'].to(device)
+                time = batch['time'].to(device)
+                event = batch['event'].to(device)
+                risk = model(x)
+                val_preds.extend(risk.cpu().numpy())
+                val_times.extend(time.cpu().numpy())
+                val_events.extend(event.cpu().numpy())
 
-# -------------------- Training Pipeline --------------------
-def train_pipeline(samples, patient_ids, modality_splits, device='cpu'):
-    X = np.stack([s['x'] for s in samples])
-    y_struct = np.array([(bool(s['event']), s['time']) for s in samples],
-                        dtype=[("event","?"),("time","<f8")])
+        val_struct = np.array([(bool(e), t) for e, t in zip(val_events, val_times)], dtype=[('event', '?'), ('time', '<f8')])
+        val_cindex = concordance_index_censored(val_struct['event'], val_struct['time'], -np.array(val_preds))[0]
 
-    scaler = StandardScaler()
-    X_scaled = np.ascontiguousarray(scaler.fit_transform(X))
+        writer.add_scalar(f"Fold{fold_idx}/ValCIndex", val_cindex, epoch)
+        print(f"Epoch {epoch + 1:03d} | Fold {fold_idx + 1} | C-Index: {val_cindex:.4f}")
 
-    cohorts = [0 if pid.startswith("3A") else 1 for pid in patient_ids]
-    strat_labels = [f"{int(e)}_{c}" for e, c in zip(y_struct['event'].astype(int), cohorts)]
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+        if val_cindex > best_val_cindex:
+            best_val_cindex = val_cindex
+            patience_counter = 0
+            torch.save(model.state_dict(), best_model_path)
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"Early stopping at epoch {epoch + 1} for fold {fold_idx + 1}")
+                break
 
-    model = build_model(X_scaled.shape[1], modality_splits, hidden_dim=224, lr=2e-4)
-    cindices = []
-    os.makedirs("checkpoints", exist_ok=True)
+    return best_val_cindex
 
-    for fold, (tr, val) in enumerate(skf.split(X_scaled, strat_labels)):
-        print(f"\n🌀 Fold {fold+1}")
-        X_train = np.ascontiguousarray(X_scaled[tr])
-        X_val = np.ascontiguousarray(X_scaled[val])
-        y_train = y_struct[tr].copy()
-        y_val = y_struct[val].copy()
 
-        model.fit(
-            X_train,
-            (np.ascontiguousarray(y_train['time']), np.ascontiguousarray(y_train['event'])),
-            batch_size=64,
-            callbacks=[tt.callbacks.EarlyStopping(patience=10)],
-            val_data=(X_val, (
-                np.ascontiguousarray(y_val['time']),
-                np.ascontiguousarray(y_val['event'])
-            )),
-            verbose=False
-        )
-        model.compute_baseline_hazards()
-
-        path = f"checkpoints/momoe_fold{fold+1}.pt"
-        torch.save(model.net.state_dict(), path)
-        print("💾 Saved:", path)
-
-        surv = model.predict_surv_df(X_val)
-        ev = EvalSurv(surv, y_val['time'], y_val['event'], censor_surv='km')
-        ci = ev.concordance_td()
-        print("✅ Fold C-Index:", round(ci, 4))
-        cindices.append(ci)
-
-    print("\n🔥 Mean C-Index:", round(np.mean(cindices), 4))
-
-# -------------------- Main --------------------
-def main():
+def run_cross_validation():
     seed_everything(42)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    patient_ids = sorted([pid for pid in os.listdir("data") if pid not in [".gitkeep", "task3_quality_control.csv"]])
-    np.random.shuffle(patient_ids)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    dataset = ChimeraDataset(patient_ids, "features/features", "features/coordinates", "data", max_patches=1024)
+    os.makedirs("checkpoints", exist_ok=True)
+    patient_ids = sorted([
+        pid for pid in os.listdir("data")
+        if pid.startswith("3")
+    ])
 
-    print("📦 Extracting features...")
-    samples = extract_patient_features(dataset, device=device)
+    dataset = ChimeraDataset(
+        patient_ids=patient_ids,
+        embeddings_dir="embeddings",
+        data_dir="data",
+        gene_list_file="test.txt"
+    )
 
-    # compute modality splits (e.g., hist=1024, rna=1000, clin=16)
-    hist_dim = 1024
-    total_feat_dim = samples[0]['x'].shape[0]
-    rna_clin_dim = total_feat_dim - hist_dim
-    clin_dim = 26  # adjust based on your clinical vector size
-    rna_dim = rna_clin_dim - clin_dim
-    splits = (hist_dim, rna_dim, clin_dim)
+    # Prepare stratification labels
+    progression_labels = []
+    for pid in patient_ids:
+        with open(os.path.join("data", pid, f"{pid}_CD.json"), 'r') as f:
+            cd = json.load(f)
+            progression_labels.append(int(cd.get("progression", 0)))
 
-    print("🚀 Training MoMoE-DeepSurv...")
-    train_pipeline(samples, patient_ids, splits, device=device)
+    strat_labels = shuffle(progression_labels, random_state=42)
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    writer = SummaryWriter(log_dir="runs/mlp_survival")
+    all_cindices = []
+
+    for fold, (train_idx, val_idx) in enumerate(skf.split(np.zeros(len(strat_labels)), strat_labels)):
+        train_loader = DataLoader(Subset(dataset, train_idx), batch_size=8, shuffle=True)
+        val_loader = DataLoader(Subset(dataset, val_idx), batch_size=8, shuffle=False)
+
+        input_dim = next(iter(train_loader))['input_vec'].shape[1]
+        model = MLP(input_dim=input_dim).to(device)
+
+        cindex = train_model(model, train_loader, val_loader, fold, writer, device=device)
+        print(f"Fold {fold + 1} C-Index: {cindex:.4f}")
+        all_cindices.append(cindex)
+
+    print("\nAverage C-Index across folds:", np.mean(all_cindices))
+    writer.close()
+
 
 if __name__ == "__main__":
-    main()
+    run_cross_validation()

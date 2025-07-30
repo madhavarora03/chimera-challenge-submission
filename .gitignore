@@ -10,3 +10,5 @@ runs
 checkpoints
 *.log
 *.pbs
+/features-512/*
+/embeddings/*.pt
