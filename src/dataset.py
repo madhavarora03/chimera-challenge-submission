@@ -61,7 +61,7 @@ class ChimeraDataset(Dataset):
         clinical_vec = encode_clinical(cd)
 
         # Time and event
-        y_time = float(cd["time_to_HG_recur_or_FUend"])
+        y_time = float(cd["Time_to_prog_or_FUend"])
         y_event = int(cd["progression"])
 
         # Final input vector

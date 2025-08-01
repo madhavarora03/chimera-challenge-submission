@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GCNConv, global_add_pool
 from torch_geometric.loader import DataLoader
-from sklearn.model_selection import KFold
+from sklearn.model_selection import train_test_split
 from lifelines.utils import concordance_index
 
 # -------------------
@@ -96,7 +96,7 @@ def run_epoch(model, loader, optimizer, device, is_train=True):
     return total_loss / len(loader.dataset), ci
 
 # -------------------
-# Optuna Objective with 5-Fold CV
+# Optuna Objective with Repeated Random Splits
 # -------------------
 def objective(trial):
     base_seed = 42
@@ -105,21 +105,23 @@ def objective(trial):
     with open("batched_graphs.pkl", "rb") as f:
         data_list = pickle.load(f)
 
-    kf = KFold(n_splits=5, shuffle=True, random_state=base_seed)
-    fold_cis = []
-
     embedding_size = trial.suggest_categorical("embedding_size", [64, 128, 256])
     dropout = trial.suggest_float("dropout", 0.1, 0.6)
     lr = trial.suggest_float("lr", 1e-4, 1e-2, log=True)
     wd = trial.suggest_float("weight_decay", 1e-6, 1e-2, log=True)
 
-    for fold_idx, (train_idx, val_idx) in enumerate(kf.split(data_list)):
-        seed_all(base_seed + fold_idx)
+    n_repeats = 5
+    fold_cis = []
 
-        train_data = [data_list[i] for i in train_idx]
-        val_data = [data_list[i] for i in val_idx]
+    for fold_idx in range(n_repeats):
+        current_seed = base_seed + fold_idx
+        seed_all(current_seed)
 
-        g = torch.Generator().manual_seed(base_seed + fold_idx)
+        train_data, val_data = train_test_split(
+            data_list, test_size=0.2, random_state=current_seed, shuffle=True
+        )
+
+        g = torch.Generator().manual_seed(current_seed)
         train_loader = DataLoader(train_data, batch_size=32, shuffle=True, generator=g, worker_init_fn=worker_init_fn)
         val_loader = DataLoader(val_data, batch_size=32, shuffle=False, worker_init_fn=worker_init_fn)
 

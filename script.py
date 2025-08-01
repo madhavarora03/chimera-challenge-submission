@@ -77,11 +77,11 @@ def process_patient(pid, features_dir, coords_dir, label_dir, max_dist, device):
         with open(json_path, 'r') as f:
             meta = json.load(f)
 
-        time_val = meta.get("time_to_HG_recur_or_FUend", None)
+        time_val = meta.get("Time_to_prog_or_FUend", None)
         progression_val = meta.get("progression", None)
 
         if time_val is None or not isinstance(time_val, (int, float)):
-            print(f"[WARN] Invalid time_to_HG_recur_or_FUend for {pid}, skipping.")
+            print(f"[WARN] Invalid Time_to_prog_or_FUend for {pid}, skipping.")
             return None
         if progression_val is None or not isinstance(progression_val, int):
             print(f"[WARN] Invalid progression for {pid}, skipping.")
