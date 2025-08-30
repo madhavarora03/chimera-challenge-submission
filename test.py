@@ -1,7 +1,6 @@
 import os
 import random
 import pickle
-import optuna
 import numpy as np
 import torch
 import torch.nn as nn
@@ -34,16 +33,18 @@ def worker_init_fn(worker_id):
 # Model Definition
 # -------------------
 class GCNSurvival(nn.Module):
-    def __init__(self, in_dim, embedding_size=128, dropout=0.5):
+    def __init__(self, in_dim, embedding_size=1280, n_layers=4, dropout=0.3167):
         super().__init__()
-        self.conv0 = GCNConv(in_dim, embedding_size)
-        self.bn0 = nn.BatchNorm1d(embedding_size)
-        self.conv1 = GCNConv(embedding_size, embedding_size)
-        self.bn1 = nn.BatchNorm1d(embedding_size)
-        self.conv2 = GCNConv(embedding_size, embedding_size)
-        self.bn2 = nn.BatchNorm1d(embedding_size)
-        self.conv3 = GCNConv(embedding_size, embedding_size)
-        self.bn3 = nn.BatchNorm1d(embedding_size)
+        self.convs = nn.ModuleList()
+        self.bns = nn.ModuleList()
+
+        self.convs.append(GCNConv(in_dim, embedding_size))
+        self.bns.append(nn.BatchNorm1d(embedding_size))
+
+        for _ in range(n_layers - 1):
+            self.convs.append(GCNConv(embedding_size, embedding_size))
+            self.bns.append(nn.BatchNorm1d(embedding_size))
+
         self.dropout = nn.Dropout(dropout)
         self.out = nn.Linear(embedding_size, 1)
 
@@ -52,10 +53,11 @@ class GCNSurvival(nn.Module):
         return self.out(x).squeeze(-1)
 
     def get_embedding(self, x, edge_index, batch):
-        x = self.conv0(x, edge_index); x = self.bn0(x); x = F.gelu(x); x = self.dropout(x)
-        x = self.conv1(x, edge_index); x = self.bn1(x); x = F.gelu(x); x = self.dropout(x)
-        x = self.conv2(x, edge_index); x = self.bn2(x); x = F.gelu(x); x = self.dropout(x)
-        x = self.conv3(x, edge_index); x = self.bn3(x); x = F.gelu(x); x = self.dropout(x)
+        for conv, bn in zip(self.convs, self.bns):
+            x = conv(x, edge_index)
+            x = bn(x)
+            x = F.gelu(x)
+            x = self.dropout(x)
         return global_add_pool(x, batch)
 
 # -------------------
@@ -65,7 +67,11 @@ def cox_ph_loss(risk, time, event):
     order = torch.argsort(time, descending=True)
     risk, time, event = risk[order], time[order], event[order]
     log_cumsum = torch.logcumsumexp(risk, dim=0)
-    return -torch.mean((risk - log_cumsum)[event == 1])
+    event_risk = risk[event == 1]
+    event_log_cumsum = log_cumsum[event == 1]
+    if len(event_risk) == 0:
+        return torch.tensor(0.0, device=risk.device)
+    return -torch.mean(event_risk - event_log_cumsum)
 
 # -------------------
 # Epoch Runner
@@ -79,9 +85,13 @@ def run_epoch(model, loader, optimizer, device, is_train=True):
         out = model(batch.x, batch.edge_index, batch.batch)
         loss = cox_ph_loss(out, batch.y[:, 0], batch.y[:, 1])
 
+        if torch.isnan(loss) or torch.isinf(loss):
+            return np.nan, np.nan
+
         if is_train:
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
         total_loss += loss.item() * batch.num_graphs
@@ -96,69 +106,72 @@ def run_epoch(model, loader, optimizer, device, is_train=True):
     return total_loss / len(loader.dataset), ci
 
 # -------------------
-# Optuna Objective with Repeated Random Splits
+# Training with Best Hyperparameters
 # -------------------
-def objective(trial):
-    base_seed = 42
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def train_with_best_hparams(data_list, device):
+    seeds = [42, 121, 144, 245, 6901]
+    mean_cis = []
 
-    with open("batched_graphs.pkl", "rb") as f:
-        data_list = pickle.load(f)
+    for seed in seeds:
+        print(f"\n🌱 Training with seed {seed}")
+        seed_all(seed)
 
-    embedding_size = trial.suggest_categorical("embedding_size", [64, 128, 256])
-    dropout = trial.suggest_float("dropout", 0.1, 0.6)
-    lr = trial.suggest_float("lr", 1e-4, 1e-2, log=True)
-    wd = trial.suggest_float("weight_decay", 1e-6, 1e-2, log=True)
+        train_data, val_data = train_test_split(data_list, test_size=0.2, random_state=seed)
+        g = torch.Generator().manual_seed(seed)
 
-    n_repeats = 5
-    fold_cis = []
-
-    for fold_idx in range(n_repeats):
-        current_seed = base_seed + fold_idx
-        seed_all(current_seed)
-
-        train_data, val_data = train_test_split(
-            data_list, test_size=0.2, random_state=current_seed, shuffle=True
-        )
-
-        g = torch.Generator().manual_seed(current_seed)
         train_loader = DataLoader(train_data, batch_size=32, shuffle=True, generator=g, worker_init_fn=worker_init_fn)
         val_loader = DataLoader(val_data, batch_size=32, shuffle=False, worker_init_fn=worker_init_fn)
 
         in_dim = data_list[0].x.size(1)
-        model = GCNSurvival(in_dim, embedding_size, dropout).to(device)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+        model = GCNSurvival(in_dim).to(device)
 
-        best_ci, best_epoch = 0.0, 0
-        patience = 15
+        optimizer = torch.optim.AdamW(model.parameters(), lr=0.0004088, weight_decay=0.0001513)
 
-        for epoch in range(1, 101):
+        best_val_ci = 0.0
+        best_model_state = None
+        patience = 10
+        patience_counter = 0
+        max_epochs = 5
+
+        for epoch in range(1, max_epochs + 1):
             train_loss, _ = run_epoch(model, train_loader, optimizer, device, is_train=True)
             val_loss, val_ci = run_epoch(model, val_loader, optimizer, device, is_train=False)
-            scheduler.step(val_loss)
 
-            if val_ci > best_ci:
-                best_ci = val_ci
-                best_epoch = epoch
+            print(f"Epoch {epoch:02d} | Train Loss: {train_loss:.4f} | Val CI: {val_ci:.4f}")
 
-            if epoch - best_epoch >= patience:
+            if val_ci > best_val_ci:
+                best_val_ci = val_ci
+                best_model_state = model.state_dict()
+                patience_counter = 0
+            else:
+                patience_counter += 1
+
+            if patience_counter >= patience:
+                print(f"⏹️ Early stopping at epoch {epoch} for seed {seed}")
                 break
 
-        fold_cis.append(best_ci)
+        model_path = f"model_seed_{seed}.pt"
+        torch.save(best_model_state, model_path)
+        print(f"✅ Best model saved to: {model_path} with CI: {best_val_ci:.4f}")
+        mean_cis.append(best_val_ci)
 
-    return np.mean(fold_cis)
+    overall_mean = np.mean(mean_cis)
+    overall_std = np.std(mean_cis)
+    print("\n🎯 Final Summary Across Seeds:")
+    print(f"Mean CI: {overall_mean:.4f} | Std Dev: {overall_std:.4f}")
 
 # -------------------
-# Run Optuna
+# Main Execution
 # -------------------
-if __name__ == "__main__":
+def main():
     seed_all(42)
-    study = optuna.create_study(direction="maximize")
-    study.optimize(objective, n_trials=30)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
 
-    print("\n🏁 Best Trial:")
-    best_trial = study.best_trial
-    for key, value in best_trial.params.items():
-        print(f"{key}: {value}")
-    print(f"Best 5-Fold CV C-Index: {best_trial.value:.4f}")
+    with open("batched_graphs.pkl", "rb") as f:
+        data_list = pickle.load(f)
+
+    train_with_best_hparams(data_list, device)
+
+if __name__ == "__main__":
+    main()

@@ -53,7 +53,6 @@ def encode_clinical(cd: Dict[str, Union[str, int, float]]) -> Tensor:
             vec[options.index(value)] = 1
         else:
             vec[0] = 1  # Default to first class if unknown
-            # print(f"⚠️ Warning: Unexpected value `{value}` for key `{key}` — defaulting to {options[0]}.")
         one_hot.extend(vec)
 
     # Append numerical features (you can normalize if needed)

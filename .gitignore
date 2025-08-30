@@ -12,3 +12,11 @@ checkpoints
 *.pbs
 /features-512/*
 /embeddings/*.pt
+batched_graphs.pkl
+batches.pkl
+model*.pt
+wsi_features_cache/
+models
+optimized_models
+optuna_models
+*.json
