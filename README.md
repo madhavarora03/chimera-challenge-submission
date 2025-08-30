@@ -62,4 +62,4 @@ Open a terminal or command prompt, and run the following command to start the Ju
 jupyter notebook notebooks/data_visualization.ipynb
 ```
 
-> Authors: Sumit Kumar, Madhav Arora, Dhairya Gupta
+> Developers: Madhav Arora, Sumit Kumar, Dhairya Gupta
