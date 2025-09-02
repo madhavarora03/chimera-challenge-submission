@@ -3,13 +3,12 @@
 > Team TBG Lab<br>
 > Task 3
 
+## Our Approach:
+<img width="10012" height="4852" alt="chimera" src="https://github.com/user-attachments/assets/c6122be3-3e90-4bd8-bf64-8e5efe5ee6ab" />
+
 ## Data Download
 
 Follow the steps below to download the dataset.
-
-Our Approach:
-<img width="10012" height="4852" alt="chimera" src="https://github.com/user-attachments/assets/c6122be3-3e90-4bd8-bf64-8e5efe5ee6ab" />
-
 
 ### Step 1: Install AWS CLI
 
