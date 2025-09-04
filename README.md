@@ -80,29 +80,40 @@ Survival analysis optimization report using 5-fold cross-validation and Optuna-b
 ##### Summary
 
 (1) Mean C-index: 0.8211 ± 0.0344
+
 (2) Best C-index: 0.8668
+
 (3) Improvement over baseline: +0.1123
+
 (4) Optimization trials per model: 100
 
 ##### Individual Seed Results
 
 (1) Seed 42: 0.8441
+
 (2) Seed 121: 0.8243
+
 (3) Seed 144: 0.7661
+
 (4) Seed 245: 0.8668
+
 (5) Seed 1212: 0.8044
 
 ##### Key Findings
 
 (1) Best Performing Models: The optimization successfully improved model performance.
+
 (2) Ensemble Benefits: Optimized ensembles showed consistent improvements.
+
 (3) Parameter Insights: Systematic hyperparameter tuning revealed optimal configurations.
 
 ##### Recommendations
 
-(1) Use the optimized hyperparameters for production models
-(2) Consider the ensemble approach for the best performance
-(3) Monitor model stability across different seeds
+(1) Use the optimized hyperparameters for production models.
+
+(2) Consider the ensemble approach for the best performance.
+
+(3) Monitor model stability across different seeds.
 
 ##### NOTE: 
 We were unable to submit our model for the competition due to an error in our Docker implementation. However, we will evaluate the model on the hidden test set once it becomes publicly available.
