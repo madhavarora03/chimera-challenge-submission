@@ -6,6 +6,15 @@
 ## Our Approach:
 <img width="10012" height="4852" alt="chimera" src="https://github.com/user-attachments/assets/c6122be3-3e90-4bd8-bf64-8e5efe5ee6ab" />
 
+1. Load WSI and divide into patches of 560x560 of the useful regions, given by the mask.
+2. Extract features and coordinates using Virchow2, a foundation model for histopathology images.
+3. Create clusters based on agglomerative clustering and make a single node with the mean of all patch-level features in the Cluster.
+4. Create a graph of each patient's WSI, where an unweighted edge is made if the distance between the central coordinates of 2 nodes is <= 3000 pixels.
+5. Extract embeddings using a custom GCN designed by us.
+6. Filter out the top 2000 genes based on the BRS deviation between BRS 1/2 and 3.
+7. Concatenate the embeddings of GCN, RNA seq data, and one-hot encoded data to form the final embedding.
+8. Finally, train attention MLP, Random Survival Forest, CoxPH, Survival SVM, and Survival Gradient boosted trees, and take a weighted ensemble of the risk scores.
+
 ## Data Download
 
 Follow the steps below to download the dataset.
