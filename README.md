@@ -104,7 +104,7 @@ Survival analysis optimization report using 5-fold cross-validation and Optuna-b
     Consider the ensemble approach for the best performance
     Monitor model stability across different seeds
 
-##### Note: 
+##### NOTE: 
 We were unable to submit our model for the competition due to an error in our Docker implementation. However, we will evaluate the model on the hidden test set once it becomes publicly available.
 
 
